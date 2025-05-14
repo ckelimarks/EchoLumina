@@ -1,0 +1,8 @@
+# Ignore the models folder
+models/
+
+# Ignore all .mp3 files
+*.mp3
+
+# Ignore all .asd files
+*.asd 
