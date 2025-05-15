@@ -348,50 +348,141 @@ function triggerEcho(originPoint, echoColorOverride) {
 
     let affectedParticleIndicesForAftershock = []; // NEW: Collect indices for aftershock
 
-    for (let i = 0; i < numParticlesToCast; i++) {
-        const phi = Math.acos(-1 + (2 * i) / numParticlesToCast);
-        const theta = Math.sqrt(numParticlesToCast * Math.PI) * phi;
-        const direction = new THREE.Vector3(
-            Math.cos(theta) * Math.sin(phi),
-            Math.sin(theta) * Math.sin(phi),
-            Math.cos(phi)
-        );
-        raycaster.set(origin, direction);
-        const intersects = raycaster.intersectObjects(echoableObjects, false);
-
-        if (intersects.length > 0) {
-            const intersection = intersects[0];
-            const point = intersection.point;
-            particlesActivatedThisEcho++;
-            const pIdx = particleIndex % MAX_PARTICLES;
-
-            posArray[pIdx * 3 + 0] = point.x;
-            posArray[pIdx * 3 + 1] = point.y;
-            posArray[pIdx * 3 + 2] = point.z;
-
-            // Determine particle color: special highlight for power-up sphere
-            let finalParticleColor = currentEchoColorToUse;
-            if (intersection.object === powerUpSphereMesh && powerUpSphereMesh.visible) {
-                finalParticleColor = POWERUP_COLOR; // Highlight with power-up's own red color
+    // NEW: Special behavior for projectile echo (ripple effect)
+    if (echoColorOverride === PROJECTILE_ECHO_PARTICLE_COLOR) {
+        // For projectile echo, we want to create a ripple effect on the surface it hits
+        
+        // First, cast a ray in the direction of projectile movement to find the impact point and normal
+        const impactRaycaster = new THREE.Raycaster(origin, new THREE.Vector3(0, -1, 0), 0, 5); // Default direction, will adjust
+        
+        // If the projectile was in flight, use its last velocity as direction
+        if (tossedProjectileMesh) {
+            if (tossedProjectileVelocity && tossedProjectileVelocity.length() > 0) {
+                const normalizedDir = tossedProjectileVelocity.clone().normalize();
+                impactRaycaster.set(origin, normalizedDir);
             }
-
-            colArray[pIdx * 4 + 0] = finalParticleColor.r;
-            colArray[pIdx * 4 + 1] = finalParticleColor.g;
-            colArray[pIdx * 4 + 2] = finalParticleColor.b;
-            colArray[pIdx * 4 + 3] = 0.0; 
-
-            sizeArray[pIdx] = 0.0; 
-            lifeArray[pIdx] = PARTICLE_INITIAL_LIFE;
+        }
+        
+        const impactIntersects = impactRaycaster.intersectObjects(echoableObjects, false);
+        let surfaceNormal = new THREE.Vector3(0, 1, 0); // Default to upward normal if no intersection
+        let impactPoint = origin.clone();
+        
+        // If we hit something, get its normal and exact impact point
+        if (impactIntersects.length > 0) {
+            const closestIntersection = impactIntersects[0];
+            surfaceNormal = closestIntersection.face ? closestIntersection.face.normal.clone() : new THREE.Vector3(0, 1, 0);
+            impactPoint = closestIntersection.point.clone();
             
-            const distance = point.distanceTo(origin); 
-            echoDistanceArray[pIdx] = distance; 
-            affectedParticleIndicesForAftershock.push(pIdx); // NEW: Add particle index
+            // Convert from object space to world space
+            const hitObject = closestIntersection.object;
+            const normalMatrix = new THREE.Matrix3().getNormalMatrix(hitObject.matrixWorld);
+            surfaceNormal.applyMatrix3(normalMatrix).normalize();
+            
+            console.log(`Projectile impact: point (${impactPoint.x.toFixed(2)}, ${impactPoint.y.toFixed(2)}, ${impactPoint.z.toFixed(2)}), normal (${surfaceNormal.x.toFixed(2)}, ${surfaceNormal.y.toFixed(2)}, ${surfaceNormal.z.toFixed(2)})`);
+        }
+        
+        // Create two perpendicular vectors in the impact plane
+        const tangent1 = new THREE.Vector3(1, 0, 0);
+        if (Math.abs(surfaceNormal.dot(tangent1)) > 0.99) {
+            // If normal is too close to x-axis, use z-axis as basis instead
+            tangent1.set(0, 0, 1);
+        }
+        tangent1.crossVectors(tangent1, surfaceNormal).normalize();
+        const tangent2 = new THREE.Vector3().crossVectors(surfaceNormal, tangent1).normalize();
+        
+        // Now create concentric rings of particles that expand from the impact point
+        const maxRadius = currentRaycasterFar * 0.5; // Half the max range
+        const numRings = 12; // Number of concentric rings
+        const pointsPerRing = Math.floor(numParticlesToCast / numRings);
+        
+        let particleIdx = 0;
+        for (let ring = 0; ring < numRings; ring++) {
+            const ringRadius = (ring + 1) * (maxRadius / numRings);
+            const ringDelay = ring * 0.05; // Increasing delay for outer rings
+            
+            for (let i = 0; i < pointsPerRing; i++) {
+                const angle = (i / pointsPerRing) * Math.PI * 2;
+                const x = Math.cos(angle);
+                const z = Math.sin(angle);
+                
+                // Calculate position on the plane defined by the normal
+                const pointPosition = new THREE.Vector3();
+                pointPosition.addScaledVector(tangent1, x * ringRadius);
+                pointPosition.addScaledVector(tangent2, z * ringRadius);
+                pointPosition.add(impactPoint);
+                
+                // Offset slightly from surface to avoid z-fighting
+                pointPosition.addScaledVector(surfaceNormal, 0.02);
+                
+                // Store particle data
+                const pIdx = particleIndex % MAX_PARTICLES;
+                
+                posArray[pIdx * 3 + 0] = pointPosition.x;
+                posArray[pIdx * 3 + 1] = pointPosition.y;
+                posArray[pIdx * 3 + 2] = pointPosition.z;
+                
+                colArray[pIdx * 4 + 0] = currentEchoColorToUse.r;
+                colArray[pIdx * 4 + 1] = currentEchoColorToUse.g;
+                colArray[pIdx * 4 + 2] = currentEchoColorToUse.b;
+                colArray[pIdx * 4 + 3] = 0.0; // Start transparent
+                
+                // Adjust life based on ring for delayed animation
+                // Inner rings should appear first, so subtract delay from initial life
+                sizeArray[pIdx] = 0.0;
+                lifeArray[pIdx] = PARTICLE_INITIAL_LIFE - ringDelay;
+                
+                // Distance is measured from impact point
+                const distance = pointPosition.distanceTo(impactPoint);
+                echoDistanceArray[pIdx] = distance;
+                
+                affectedParticleIndicesForAftershock.push(pIdx);
+                particleIndex++;
+                particlesActivatedThisEcho++;
+            }
+        }
+    } else {
+        // Original spherical echo behavior for normal and red echoes
+        for (let i = 0; i < numParticlesToCast; i++) {
+            const phi = Math.acos(-1 + (2 * i) / numParticlesToCast);
+            const theta = Math.sqrt(numParticlesToCast * Math.PI) * phi;
+            const direction = new THREE.Vector3(
+                Math.cos(theta) * Math.sin(phi),
+                Math.sin(theta) * Math.sin(phi),
+                Math.cos(phi)
+            );
+            raycaster.set(origin, direction);
+            const intersects = raycaster.intersectObjects(echoableObjects, false);
 
-            // Removed detailed particle activation log for brevity now
-            // if (particlesActivatedThisEcho <= 5) { 
-            //     console.log(`Activated particle in slot ${pIdx}: pos(${point.x.toFixed(2)}, ${point.y.toFixed(2)}, ${point.z.toFixed(2)}), dist: ${distance.toFixed(2)}`);
-            // }
-            particleIndex++;
+            if (intersects.length > 0) {
+                const intersection = intersects[0];
+                const point = intersection.point;
+                particlesActivatedThisEcho++;
+                const pIdx = particleIndex % MAX_PARTICLES;
+
+                posArray[pIdx * 3 + 0] = point.x;
+                posArray[pIdx * 3 + 1] = point.y;
+                posArray[pIdx * 3 + 2] = point.z;
+
+                // Determine particle color: special highlight for power-up sphere
+                let finalParticleColor = currentEchoColorToUse;
+                if (intersection.object === powerUpSphereMesh && powerUpSphereMesh.visible) {
+                    finalParticleColor = POWERUP_COLOR; // Highlight with power-up's own red color
+                }
+
+                colArray[pIdx * 4 + 0] = finalParticleColor.r;
+                colArray[pIdx * 4 + 1] = finalParticleColor.g;
+                colArray[pIdx * 4 + 2] = finalParticleColor.b;
+                colArray[pIdx * 4 + 3] = 0.0; 
+
+                sizeArray[pIdx] = 0.0; 
+                lifeArray[pIdx] = PARTICLE_INITIAL_LIFE;
+                
+                const distance = point.distanceTo(origin); 
+                echoDistanceArray[pIdx] = distance; 
+                affectedParticleIndicesForAftershock.push(pIdx); // NEW: Add particle index
+
+                particleIndex++;
+            }
         }
     }
     // console.log("Particles activated this echo:", particlesActivatedThisEcho); // Can be spammy
