@@ -155,7 +155,7 @@ let PLAYER_START_Z = 0;
 const POWERUP_DURATION = 30.0; // seconds
 const POWERUP_COLOR = new THREE.Color(0xff0000); // Red
 const NORMAL_ECHO_COLOR = new THREE.Color(0x00ffff); // Existing echo color
-const PROJECTILE_ECHO_PARTICLE_COLOR = new THREE.Color(0x5D3FD3); // Modified: Darker purple for projectile echo particles
+const PROJECTILE_ECHO_PARTICLE_COLOR = new THREE.Color(0x800080); // Purple for projectile echo particles
 const PROJECTILE_PICKUP_VISIBLE_COLOR = new THREE.Color(0x6A0DAD); // Visible purple for the pickup item
 const POWERUP_RAYCASTER_FAR = 15.0;
 const NORMAL_RAYCASTER_FAR = 35.0; // Default echo range
@@ -320,8 +320,7 @@ function triggerEcho(originPoint, echoColorOverride) {
     // Determine number of particles to cast for this specific echo
     let numParticlesToCast = PARTICLES_PER_ECHO;
     if (echoColorOverride === PROJECTILE_ECHO_PARTICLE_COLOR) {
-        // Modified: Increase particle count but make them smaller and more subtle
-        numParticlesToCast = Math.floor(PARTICLES_PER_ECHO * PROJECTILE_ECHO_PARTICLE_MULTIPLIER * 1.5);
+        numParticlesToCast = Math.floor(PARTICLES_PER_ECHO * PROJECTILE_ECHO_PARTICLE_MULTIPLIER);
         console.log(`Projectile echo: Casting ${numParticlesToCast} particles.`);
     }
 
@@ -350,45 +349,13 @@ function triggerEcho(originPoint, echoColorOverride) {
     let affectedParticleIndicesForAftershock = []; // NEW: Collect indices for aftershock
 
     for (let i = 0; i < numParticlesToCast; i++) {
-        // Modified: For projectile echo, use a narrower cone pattern for particles
-        let direction;
-        if (echoColorOverride === PROJECTILE_ECHO_PARTICLE_COLOR) {
-            // Create a more directional, narrower cone for projectile echo
-            // Use a blend of forward direction and spherical pattern
-            
-            // Get forward direction based on projectile velocity or camera direction
-            const forwardDir = tossedProjectileVelocity ? 
-                               tossedProjectileVelocity.clone().normalize() : 
-                               new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
-                               
-            // Calculate spherical coordinates with narrower distribution
-            const phi = Math.acos(-1 + (2 * i) / numParticlesToCast);
-            // Narrower spread - reduce theta range by multiplying by a factor less than 1
-            const theta = Math.sqrt(numParticlesToCast * Math.PI) * phi * 0.6;
-            
-            // Create base direction 
-            const sphereDir = new THREE.Vector3(
-                Math.cos(theta) * Math.sin(phi),
-                Math.sin(theta) * Math.sin(phi),
-                Math.cos(phi)
-            );
-            
-            // Mix forward direction with spherical pattern - weighted toward forward
-            direction = new THREE.Vector3();
-            direction.addScaledVector(forwardDir, 0.65); // 65% forward
-            direction.addScaledVector(sphereDir, 0.35); // 35% spherical
-            direction.normalize();
-        } else {
-            // Original spherical distribution for regular echoes
-            const phi = Math.acos(-1 + (2 * i) / numParticlesToCast);
-            const theta = Math.sqrt(numParticlesToCast * Math.PI) * phi;
-            direction = new THREE.Vector3(
-                Math.cos(theta) * Math.sin(phi),
-                Math.sin(theta) * Math.sin(phi),
-                Math.cos(phi)
-            );
-        }
-        
+        const phi = Math.acos(-1 + (2 * i) / numParticlesToCast);
+        const theta = Math.sqrt(numParticlesToCast * Math.PI) * phi;
+        const direction = new THREE.Vector3(
+            Math.cos(theta) * Math.sin(phi),
+            Math.sin(theta) * Math.sin(phi),
+            Math.cos(phi)
+        );
         raycaster.set(origin, direction);
         const intersects = raycaster.intersectObjects(echoableObjects, false);
 
@@ -413,19 +380,17 @@ function triggerEcho(originPoint, echoColorOverride) {
             colArray[pIdx * 4 + 2] = finalParticleColor.b;
             colArray[pIdx * 4 + 3] = 0.0; 
 
-            // Adjust size for projectile echo - smaller particles for more subtle effect
-            if (echoColorOverride === PROJECTILE_ECHO_PARTICLE_COLOR) {
-                sizeArray[pIdx] = 0.0;  
-                lifeArray[pIdx] = PARTICLE_INITIAL_LIFE * 0.8; // 20% shorter lifespan
-            } else {
-                sizeArray[pIdx] = 0.0;
-                lifeArray[pIdx] = PARTICLE_INITIAL_LIFE;
-            }
+            sizeArray[pIdx] = 0.0; 
+            lifeArray[pIdx] = PARTICLE_INITIAL_LIFE;
             
             const distance = point.distanceTo(origin); 
             echoDistanceArray[pIdx] = distance; 
-            affectedParticleIndicesForAftershock.push(pIdx);
+            affectedParticleIndicesForAftershock.push(pIdx); // NEW: Add particle index
 
+            // Removed detailed particle activation log for brevity now
+            // if (particlesActivatedThisEcho <= 5) { 
+            //     console.log(`Activated particle in slot ${pIdx}: pos(${point.x.toFixed(2)}, ${point.y.toFixed(2)}, ${point.z.toFixed(2)}), dist: ${distance.toFixed(2)}`);
+            // }
             particleIndex++;
         }
     }
@@ -1444,19 +1409,6 @@ function animate() {
                 baseAlpha = easedFadeInProgress;
                 baseSize = PARTICLE_BASE_SIZE * easedFadeInProgress;
             }
-            
-            // NEW: Special handling for projectile echo particles - make them more subtle
-            // Check if this particle is a projectile echo particle by its color
-            if (colArray[i * 4 + 0] === PROJECTILE_ECHO_PARTICLE_COLOR.r && 
-                colArray[i * 4 + 1] === PROJECTILE_ECHO_PARTICLE_COLOR.g && 
-                colArray[i * 4 + 2] === PROJECTILE_ECHO_PARTICLE_COLOR.b) {
-                
-                // Make the alpha more translucent
-                baseAlpha *= 0.65;
-                
-                // Make the particles smaller
-                baseSize *= 0.7;
-            }
         }
 
         // Set initial attributes based on lifecycle (before aftershock adjustments)
@@ -2079,16 +2031,13 @@ function throwProjectile() {
 
     scene.add(tossedProjectileMesh);
     tossedProjectileMesh.visible = true;
+    // REMOVE: isProjectileEchoPowerUpActive = false; 
+    // REMOVE: stopBeatSound(); 
+    // REMOVE: if (projectilePowerUpSphereMesh) { projectilePowerUpSphereMesh.visible = true; }
 
     // Set projectile velocity
     camera.getWorldDirection(tossedProjectileVelocity);
     tossedProjectileVelocity.multiplyScalar(PROJECTILE_SPEED);
-
-    // Add slight random variation to make projectiles feel more natural
-    tossedProjectileVelocity.x += (Math.random() - 0.5) * 2;
-    tossedProjectileVelocity.y += (Math.random() - 0.5) * 1;
-    tossedProjectileVelocity.z += (Math.random() - 0.5) * 2;
-    tossedProjectileVelocity.normalize().multiplyScalar(PROJECTILE_SPEED);
 
     console.log("Projectile thrown!");
 } 
