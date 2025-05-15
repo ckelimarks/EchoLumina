@@ -84,6 +84,19 @@ const FOOTSTEP_SPRINT_PLAYBACK_RATE = 1.6;
 const FOOTSTEP_FADE_DURATION_MS = 200; // Milliseconds for fade in/out
 const FOOTSTEP_STOP_DELAY_MS = FOOTSTEP_FADE_DURATION_MS + 100; // Delay before actually stopping the source node
 
+// NEW: BPM-based Visual Pulse Constants & State
+const BEAT_PULSE_BPM = 120.0;
+const EIGHTH_NOTE_INTERVAL_MS = (60000.0 / BEAT_PULSE_BPM) / 2.0; // Calculate 1/8th note interval
+
+const BEAT_PULSE_INTERVAL_MS = EIGHTH_NOTE_INTERVAL_MS; // Pulse on 1/8th notes
+const BEAT_VISUAL_PULSE_EFFECT_DURATION_MS = BEAT_PULSE_INTERVAL_MS * 0.8; // Visual pulse is sharp, e.g. 80% of 1/8th note interval
+const BEAT_VISUAL_PULSE_MAX_ALPHA_BOOST = 0.35; // Max additional alpha (0 to 1) - slightly increased for more impact
+
+let beatTrackAudioStartTime = -1; // When bgambiencebeat.mp3 actually started (audioContext.currentTime)
+let lastProcessedBeatCount = -1;
+let isBeatVisualPulseActive = false;
+let beatVisualPulseEffect_StartTime = 0; // audioContext.currentTime when the visual pulse effect started
+
 // NEW: Filename arrays (re-added for Web Audio loading)
 const echoNoteFilenames = [
     'notes/echonote1.mp3',
@@ -135,8 +148,8 @@ const PIT_SIZE = 5.0;      // NEW
 const PIT_HALF_SIZE = PIT_SIZE / 2; // NEW
 const DEATH_Y_LEVEL = -10.0; // NEW
 
-const PLAYER_START_X = -12;
-const PLAYER_START_Z = 0;
+let PLAYER_START_X = -12;
+let PLAYER_START_Z = 0;
 
 // Power-up Constants & State - NEW
 const POWERUP_DURATION = 30.0; // seconds
@@ -173,6 +186,11 @@ const PROJECTILE_SPEED = 25.0;
 const PROJECTILE_MAX_LIFE = 3.0; // seconds
 let projectileCurrentLife = 0;
 
+// Mini-map variables
+let miniMapCanvas;
+let miniMapContext;
+let miniMapScale = 2.5; // Increased scale for better visibility
+
 // Function declarations moved BEFORE init()
 
 function easeOutCubic(t) { // t is from 0 to 1
@@ -186,28 +204,29 @@ function scheduleBeatSoundStart() {
         startBeatSoundTimeout = null;
     }
 
-    // --- RESTORED ORIGINAL SYNC LOGIC --- 
-    if (!isProjectileEchoPowerUpActive || !backgroundBeatSound || (backgroundBeatSound.currentTime > 0 && !backgroundBeatSound.paused)) {
-        console.log("[scheduleBeatSoundStart] Returning early. Conditions: isProjectileEchoPowerUpActive=", isProjectileEchoPowerUpActive, "backgroundBeatSound exists=", !!backgroundBeatSound, "beat sound already playing=", backgroundBeatSound && backgroundBeatSound.currentTime > 0 && !backgroundBeatSound.paused);
-        return;
+    // --- MODIFIED: Play immediately if power-up active and sound is loaded & paused --- 
+    if (isProjectileEchoPowerUpActive && backgroundBeatSound && backgroundBeatSound.readyState >= 2 && backgroundBeatSound.paused) {
+        console.log("[scheduleBeatSoundStart] Attempting to play backgroundBeatSound immediately.");
+        backgroundBeatSound.play().then(() => {
+            console.log("backgroundBeatSound started immediately.");
+            if (audioContext) beatTrackAudioStartTime = audioContext.currentTime; // Record start time for visual pulse
+            lastProcessedBeatCount = -1; // Reset beat count
+            isBeatVisualPulseActive = false; // Ensure visual pulse is not stuck active
+        }).catch(e => console.error("Error playing backgroundBeatSound (immediate attempt):", e));
+    } else if (!isProjectileEchoPowerUpActive) {
+        console.log("[scheduleBeatSoundStart] Returning early: Projectile PowerUp not active.");
+    } else if (!backgroundBeatSound || backgroundBeatSound.readyState < 2) {
+        console.log("[scheduleBeatSoundStart] Returning early: backgroundBeatSound not loaded/ready.");
+    } else if (!backgroundBeatSound.paused) {
+        console.log("[scheduleBeatSoundStart] backgroundBeatSound is already playing.");
+        // If it's already playing and beatTrackAudioStartTime is not set, set it now.
+        if (beatTrackAudioStartTime === -1 && audioContext) {
+            beatTrackAudioStartTime = audioContext.currentTime - backgroundBeatSound.currentTime; // Estimate original start time
+            lastProcessedBeatCount = Math.floor(((audioContext.currentTime - beatTrackAudioStartTime) * 1000) / BEAT_PULSE_INTERVAL_MS) -1 ;
+            console.log("backgroundBeatSound was already playing, re-syncing beatTrackAudioStartTime");
+        }
     }
-
-    if (backgroundAmbianceSound && backgroundAmbianceSound.readyState >= 2 && backgroundAmbianceSound.duration > 0 && !backgroundAmbianceSound.paused) {
-        // Ambiance sound is loaded and playing
-        const timeRemainingInLoop = (backgroundAmbianceSound.duration - (backgroundAmbianceSound.currentTime % backgroundAmbianceSound.duration)) * 1000; // in ms
-        
-        console.log(`Scheduling beat sound to start in ${timeRemainingInLoop.toFixed(2)}ms`);
-        startBeatSoundTimeout = setTimeout(() => {
-            if (isProjectileEchoPowerUpActive && backgroundBeatSound) { // Double check power-up still active
-                backgroundBeatSound.play().catch(e => console.error("Error playing backgroundBeatSound:", e));
-                console.log("backgroundBeatSound started via schedule.");
-            }
-            startBeatSoundTimeout = null;
-        }, timeRemainingInLoop);
-    } else {
-        // Ambiance sound not ready or not playing. Beat sound will attempt to start when ambiance starts, if power-up is active.
-        console.log("Ambiance sound not ready for beat sync, will try when ambiance starts.");
-    }
+    // --- END OF MODIFIED SECTION ---
 }
 
 function stopBeatSound() {
@@ -220,6 +239,10 @@ function stopBeatSound() {
         backgroundBeatSound.currentTime = 0;
         console.log("backgroundBeatSound stopped and reset.");
     }
+    // NEW: Reset BPM pulse state variables
+    beatTrackAudioStartTime = -1;
+    lastProcessedBeatCount = -1;
+    isBeatVisualPulseActive = false;
 }
 
 const raycaster = new THREE.Raycaster();
@@ -413,6 +436,17 @@ function init() {
         // Fallback or error message if needed
     }
 
+    // Initialize Mini-map
+    miniMapCanvas = document.getElementById('miniMap');
+    if (miniMapCanvas) {
+        miniMapCanvas.width = 200;
+        miniMapCanvas.height = 200;
+        miniMapContext = miniMapCanvas.getContext('2d');
+        console.log("Mini-map initialized.");
+    } else {
+        console.warn("Mini-map canvas not found.");
+    }
+
     // Scene
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0x000000);
@@ -457,9 +491,6 @@ function init() {
         baseMaterialProps
     );
 
-    // Maze Walls - NEW
-    buildMaze(); // Call function to construct the maze
-
     // Create Power-up Sphere - NEW
     POWERUP_ECHO_FADE_DURATION = ECHO_FADE_DURATION * 2.5; // Define it here
     const sphereGeometry = new THREE.SphereGeometry(0.5, 16, 16); // Restored original size
@@ -493,6 +524,9 @@ function init() {
     projectilePowerUpSphereMesh.userData.aabb = new THREE.Box3().setFromObject(projectilePowerUpSphereMesh);
     projectilePowerUpSphereMesh.userData.isProjectilePowerUp = true; // Tag it
     console.log("Projectile Power-up sphere (purple) created at:", projectilePowerUpSphereMesh.position);
+
+    // Maze Walls - MOVED after power-up creation
+    buildMaze(); // Call function to construct the maze
 
     // NEW: Create Tossed Projectile Mesh (initially invisible)
     const tossedProjectileGeom = new THREE.SphereGeometry(0.1, 8, 8); // Made smaller (was 0.2)
@@ -1234,6 +1268,23 @@ function animate() {
             if (projectilePowerUpSphereMesh) projectilePowerUpSphereMesh.visible = true;
             console.log("Projectile Power-up expired.");
         }
+    } else { // If projectile power up is NOT active, ensure beat tracking is reset
+        if (beatTrackAudioStartTime !== -1) { // If it was active and now it's not
+            stopBeatSound(); // This will reset beatTrackAudioStartTime, etc.
+        }
+    }
+
+    // BPM Visual Pulse Detection Logic
+    if (isProjectileEchoPowerUpActive && beatTrackAudioStartTime !== -1 && audioContext) {
+        const elapsedSinceBeatTrackStartMs = (audioContext.currentTime - beatTrackAudioStartTime) * 1000;
+        const currentBeatSlot = Math.floor(elapsedSinceBeatTrackStartMs / BEAT_PULSE_INTERVAL_MS);
+
+        if (currentBeatSlot > lastProcessedBeatCount) {
+            isBeatVisualPulseActive = true;
+            beatVisualPulseEffect_StartTime = audioContext.currentTime;
+            lastProcessedBeatCount = currentBeatSlot;
+            // console.log("Beat pulse triggered for slot:", currentBeatSlot);
+        }
     }
 
     // Note: Projectile power-up is a one-time use per pickup for now, no timer. // <<< This comment is now outdated
@@ -1413,6 +1464,33 @@ function animate() {
     }
     activeAftershocks = stillActiveAftershocks;
 
+    // NEW: Apply BPM Visual Pulse to alpha (after aftershocks, before final needsUpdate check)
+    if (isBeatVisualPulseActive && audioContext) {
+        const elapsedEffectTimeSec = audioContext.currentTime - beatVisualPulseEffect_StartTime;
+        const effectDurationSec = BEAT_VISUAL_PULSE_EFFECT_DURATION_MS / 1000.0;
+
+        if (elapsedEffectTimeSec < effectDurationSec) {
+            // Calculate pulse intensity (0 -> 1 -> 0 using sine curve over the effect duration)
+            const pulseProgress = elapsedEffectTimeSec / effectDurationSec;
+            // const pulseIntensity = Math.sin(pulseProgress * Math.PI); // Old sine wave
+            const pulseIntensity = 1.0 - pulseProgress; // NEW: Linear decay (sawtooth for the boost effect)
+            const alphaBoost = BEAT_VISUAL_PULSE_MAX_ALPHA_BOOST * pulseIntensity;
+
+            for (let i = 0; i < MAX_PARTICLES; i++) {
+                if (lifeArray[i] > 0) { // Only affect active particles
+                    const currentAlpha = colArray[i * 4 + 3];
+                    const boostedAlpha = Math.min(1.0, currentAlpha + alphaBoost);
+                    if (colArray[i * 4 + 3] !== boostedAlpha) {
+                        colArray[i * 4 + 3] = boostedAlpha;
+                        colorDataChanged = true;
+                    }
+                }
+            }
+        } else {
+            isBeatVisualPulseActive = false; // End of current visual pulse
+        }
+    }
+
     if (lifeDataChanged || sizeDataChanged || colorDataChanged) {
         if (lifeDataChanged) particleSystem.geometry.attributes.life.needsUpdate = true;
         if (sizeDataChanged) particleSystem.geometry.attributes.size.needsUpdate = true;
@@ -1420,6 +1498,9 @@ function animate() {
     }
 
     renderer.render(scene, camera);
+
+    // Update the mini-map
+    renderMiniMap();
 }
 
 // Start everything
@@ -1459,66 +1540,355 @@ function createWall(x, z, length, orientation, customThickness = WALL_THICKNESS,
 }
 
 function buildMaze() {
-    // Using a slightly larger scale and adjusting coordinates from previous thought process
-    // These coordinates define the CENTER of the wall segments.
+    console.log("Building procedural maze...");
+    
+    // Clear any existing walls
+    for (let wall of walls) {
+        scene.remove(wall);
+        const echoableIndex = echoableObjects.indexOf(wall);
+        if (echoableIndex !== -1) {
+            echoableObjects.splice(echoableIndex, 1);
+        }
+    }
+    // Clear the array instead of reassigning it
+    walls.length = 0;
+    
+    // Maze parameters
+    const mazeSize = 9; // Smaller maze with clearer structure
+    const cellSize = 6; // Larger cells for better visibility
+    const wallThickness = 1.0; // Thicker walls for better visibility on minimap
+    
+    // Maze grid: 0 = wall, 1 = path
+    const maze = generateMaze(mazeSize);
+    
+    // Center of the maze in world coordinates
+    const mazeOffsetX = -((mazeSize * cellSize) / 2);
+    const mazeOffsetZ = -((mazeSize * cellSize) / 2);
+    
+    // Build the maze walls based on grid
+    for (let x = 0; x < mazeSize; x++) {
+        for (let z = 0; z < mazeSize; z++) {
+            if (maze[x][z] === 0) { // This is a wall cell
+                const worldX = mazeOffsetX + x * cellSize + cellSize / 2;
+                const worldZ = mazeOffsetZ + z * cellSize + cellSize / 2;
+                
+                // Create a wall block at this position
+                const wall = new THREE.Mesh(
+                    new THREE.BoxGeometry(cellSize, WALL_HEIGHT, cellSize),
+                    new THREE.MeshStandardMaterial({ 
+                        color: 0x222222, // Dark grey for walls
+                        roughness: 0.8,
+                        metalness: 0.1
+                    })
+                );
+                wall.position.set(worldX, WALL_HEIGHT / 2, worldZ);
+                
+                // Calculate AABB for collision
+                wall.userData.aabb = new THREE.Box3(
+                    new THREE.Vector3(worldX - cellSize/2, 0, worldZ - cellSize/2),
+                    new THREE.Vector3(worldX + cellSize/2, WALL_HEIGHT, worldZ + cellSize/2)
+                );
+                
+                walls.push(wall);
+                scene.add(wall);
+                echoableObjects.push(wall);
+            }
+        }
+    }
+    
+    // Find a path cell for the player to start (using the first path cell)
+    let startX, startZ;
+    let pathCells = []; // Track all path cells for power-up placement
+    
+    for (let x = 0; x < mazeSize; x++) {
+        for (let z = 0; z < mazeSize; z++) {
+            if (maze[x][z] === 1) {
+                const worldX = mazeOffsetX + x * cellSize + cellSize / 2;
+                const worldZ = mazeOffsetZ + z * cellSize + cellSize / 2;
+                
+                // Store all path cells for later use
+                pathCells.push({x: worldX, z: worldZ, gridX: x, gridZ: z});
+                
+                // Set the start position to the first path cell found
+                if (!startX && !startZ) {
+                    startX = worldX;
+                    startZ = worldZ;
+                }
+            }
+        }
+    }
+    
+    // Function to check if a cell is far enough from walls
+    const isValidPickupLocation = (cell, maze, mazeSize) => {
+        const x = cell.gridX;
+        const z = cell.gridZ;
+        
+        // Only check the four immediate adjacent cells (no diagonals)
+        // This is less strict than checking all 8 surrounding cells
+        const adjacentOffsets = [
+            [0, -1], // North
+            [1, 0],  // East
+            [0, 1],  // South
+            [-1, 0]  // West
+        ];
+        
+        // Check if any adjacent cells are walls
+        for (const [dx, dz] of adjacentOffsets) {
+            const nx = x + dx;
+            const nz = z + dz;
+            
+            // Skip if out of bounds
+            if (nx < 0 || nx >= mazeSize || nz < 0 || nz >= mazeSize) continue;
+            
+            // If adjacent cell is a wall, this location is not valid
+            if (maze[nx][nz] === 0) return false;
+        }
+        
+        return true;
+    };
+    
+    // Filter out cells that are too close to walls
+    const validPathCells = pathCells.filter(cell => isValidPickupLocation(cell, maze, mazeSize));
+    
+    // Store globally for debugging
+    window._debugPathCells = validPathCells;
+    
+    console.log(`Path cells found: ${pathCells.length}, Valid path cells after filtering: ${validPathCells.length}`);
+    if (validPathCells.length === 0 && pathCells.length > 0) {
+        console.warn("No valid path cells found after filtering! Maze might be too small or compact.");
+        // Log a few path cells for debugging
+        pathCells.slice(0, Math.min(3, pathCells.length)).forEach((cell, i) => {
+            console.log(`Sample path cell ${i}:`, cell);
+        });
+    }
+    
+    // Place power-ups if we have valid cells
+    if (validPathCells.length > 5) {
+        console.log("Found", validPathCells.length, "valid path cells for power-up placement");
+        // Sort cells by distance from start
+        validPathCells.sort((a, b) => {
+            const distA = Math.sqrt(Math.pow(a.x - startX, 2) + Math.pow(a.z - startZ, 2));
+            const distB = Math.sqrt(Math.pow(b.x - startX, 2) + Math.pow(b.z - startZ, 2));
+            return distB - distA; // Descending order to get farthest first
+        });
+        
+        // Ensure we only pick locations that are far enough apart from each other
+        const MIN_DISTANCE_BETWEEN_PICKUPS = cellSize * 1.5; // REDUCED: Only 1.5 cells apart instead of 3
+        const selectedCells = [];
+        
+        // Get the first valid cell for red power-up
+        selectedCells.push(validPathCells[0]);
+        
+        // Find a cell for the purple power-up that's far enough from the red one
+        let purplePickupCell = null;
+        for (let i = 1; i < validPathCells.length; i++) {
+            let isFarEnough = true;
+            
+            // Check distance to all previously selected cells
+            for (const selected of selectedCells) {
+                const distance = Math.sqrt(
+                    Math.pow(validPathCells[i].x - selected.x, 2) + 
+                    Math.pow(validPathCells[i].z - selected.z, 2)
+                );
+                
+                if (distance < MIN_DISTANCE_BETWEEN_PICKUPS) {
+                    isFarEnough = false;
+                    break;
+                }
+            }
+            
+            if (isFarEnough) {
+                purplePickupCell = validPathCells[i];
+                selectedCells.push(purplePickupCell);
+                break;
+            }
+        }
+        
+        // If we couldn't find a far enough cell, pick the farthest available
+        if (!purplePickupCell && validPathCells.length > 1) {
+            console.log("Couldn't find a far enough cell for purple pickup, using next available");
+            purplePickupCell = validPathCells[1];
+            selectedCells.push(purplePickupCell);
+        }
+        
+        // Place red power-up
+        if (powerUpSphereMesh && selectedCells.length > 0) {
+            const redCell = selectedCells[0];
+            powerUpSphereMesh.position.set(
+                redCell.x, 
+                playerHeight, 
+                redCell.z
+            );
+            powerUpSphereMesh.userData.aabb.setFromObject(powerUpSphereMesh);
+            powerUpSphereMesh.visible = true;
+            console.log("Red power-up placed at:", redCell, "Position:", powerUpSphereMesh.position);
+        } else {
+            console.warn("Could not place red power-up:", 
+                        powerUpSphereMesh ? "sphere exists" : "sphere missing", 
+                        selectedCells.length > 0 ? "cells available" : "no cells available");
+        }
+        
+        // Place projectile power-up
+        if (projectilePowerUpSphereMesh && selectedCells.length > 1) {
+            const purpleCell = selectedCells[1];
+            projectilePowerUpSphereMesh.position.set(
+                purpleCell.x, 
+                playerHeight, 
+                purpleCell.z
+            );
+            projectilePowerUpSphereMesh.userData.aabb.setFromObject(projectilePowerUpSphereMesh);
+            projectilePowerUpSphereMesh.visible = true;
+            console.log("Projectile power-up placed at:", purpleCell, "Position:", projectilePowerUpSphereMesh.position);
+        } else {
+            console.warn("Could not place purple power-up:", 
+                        projectilePowerUpSphereMesh ? "sphere exists" : "sphere missing", 
+                        selectedCells.length > 1 ? "cells available" : "not enough cells available");
+        }
+    } else {
+        console.warn("Not enough valid path cells for power-up placement. Using fallback positioning.");
+        
+        // IMPROVED FALLBACK: Better distribute power-ups when limited valid cells
+        // Use the available cells but shuffle them first to add randomness
+        const cellsToUse = pathCells.length > 1 ? [...pathCells] : [{x: startX, z: startZ}];
+        
+        // Basic array shuffle (Fisher-Yates algorithm)
+        for (let i = cellsToUse.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [cellsToUse[i], cellsToUse[j]] = [cellsToUse[j], cellsToUse[i]];
+        }
+        
+        // Place red power-up in a random location that's different from player start if possible
+        let redIndex = 0;
+        // If more than one cell and the first happens to be player start, use different cell
+        if (cellsToUse.length > 1 && 
+            Math.abs(cellsToUse[0].x - startX) < 0.1 && 
+            Math.abs(cellsToUse[0].z - startZ) < 0.1) {
+            redIndex = 1;
+        }
+        
+        // Place purple power-up in a different location if possible
+        let purpleIndex = redIndex + 1;
+        if (purpleIndex >= cellsToUse.length) purpleIndex = (redIndex === 0) ? 0 : 0;
+        
+        // Handle the single cell edge case
+        const useOffset = cellsToUse.length === 1;
+        
+        // Place red powerup
+        if (powerUpSphereMesh) {
+            powerUpSphereMesh.position.set(
+                cellsToUse[redIndex].x + (useOffset ? -1.5 : 0), 
+                playerHeight, 
+                cellsToUse[redIndex].z + (useOffset ? 1.5 : 0)
+            );
+            powerUpSphereMesh.userData.aabb.setFromObject(powerUpSphereMesh);
+            powerUpSphereMesh.visible = true;
+            console.log("Red power-up placed at (fallback):", 
+                      useOffset ? "offset from" : "", cellsToUse[redIndex], 
+                      "Position:", powerUpSphereMesh.position);
+        }
+        
+        // Place purple powerup
+        if (projectilePowerUpSphereMesh) {
+            projectilePowerUpSphereMesh.position.set(
+                cellsToUse[purpleIndex].x + (useOffset ? 1.5 : 0), 
+                playerHeight, 
+                cellsToUse[purpleIndex].z + (useOffset ? -1.5 : 0)
+            );
+            projectilePowerUpSphereMesh.userData.aabb.setFromObject(projectilePowerUpSphereMesh);
+            projectilePowerUpSphereMesh.visible = true;
+            console.log("Purple power-up placed at (fallback):", 
+                      useOffset ? "offset from" : "", cellsToUse[purpleIndex], 
+                      "Position:", projectilePowerUpSphereMesh.position);
+        }
+    }
+    
+    // Set player starting position within the maze - MODIFIED TO PREVENT SPAWNING ON POWER-UPS
+    PLAYER_START_X = startX;
+    PLAYER_START_Z = startZ;
+    
+    // Check if player would spawn on red power-up
+    if (powerUpSphereMesh && Math.abs(PLAYER_START_X - powerUpSphereMesh.position.x) < 1 && 
+        Math.abs(PLAYER_START_Z - powerUpSphereMesh.position.z) < 1) {
+        // Add offset to prevent spawning on power-up
+        PLAYER_START_X += 2;
+        PLAYER_START_Z += 2;
+        console.log("Adjusted player start position to avoid spawning on red power-up");
+    }
+    
+    // Check if player would spawn on purple power-up
+    if (projectilePowerUpSphereMesh && Math.abs(PLAYER_START_X - projectilePowerUpSphereMesh.position.x) < 1 && 
+        Math.abs(PLAYER_START_Z - projectilePowerUpSphereMesh.position.z) < 1) {
+        // Add offset to prevent spawning on power-up
+        PLAYER_START_X += 2;
+        PLAYER_START_Z -= 2;
+        console.log("Adjusted player start position to avoid spawning on purple power-up");
+    }
+    
+    camera.position.set(PLAYER_START_X, playerHeight, PLAYER_START_Z);
+    
+    console.log(`Maze built with ${walls.length} wall segments. Player starting at (${PLAYER_START_X}, ${PLAYER_START_Z}).`);
+}
 
-    // Outer boundary estimations (adjust as needed)
-    const minX = -15, maxX = 20;
-    const minZ = -12, maxZ = 18;
-
-    // Top-Left Area & Corridor to Top Enemy
-    createWall(-7.5, -10, 15, 'horizontal'); // Top wall of big room
-    createWall(-15, -2.5, 15, 'vertical');   // Left wall of big room
-    createWall(-7.5, 5, 15, 'horizontal');   // Bottom wall of big room (partially)
-    createWall(0, -2.5, 10, 'vertical');     // Right wall of big room / corridor wall
-    createWall(7.5, -10, 15, 'horizontal');  // Top wall of corridor to ENEMY
-    createWall(2.5, 0, 5, 'horizontal');    // Bottom wall of short corridor part
-    createWall(15, -5, 10, 'vertical');      // Right wall of corridor to ENEMY / Left of ENEMY
-
-    // Top ENEMY Area
-    createWall(22.5, -10, 15, 'horizontal'); // Top wall ENEMY
-    createWall(30, -2.5, 15, 'vertical');   // Right wall ENEMY
-    createWall(22.5, 5, 15, 'horizontal');  // Bottom wall ENEMY
-    // createWall(15, -2.5, 10, 'vertical'); // Already created as part of corridor
-
-    // Central Passage (below top ENEMY, above PUZZLEs)
-    createWall(7.5, 5, 15, 'horizontal'); // Wall between corridor & central passage (shares with big room bottom)
-                                         // This might need adjustment or one part removed based on desired openings
-                                         // Assuming wall -7.5, 5, 15 covers this. Then create wall below it:
-    createWall(12.5, 8, 25, 'horizontal');  // Bottom of central horizontal passage
-
-    // Connecting Walls and PUZZLE area separators
-    createWall(0, 10, 10, 'vertical');      // Vertical wall between big room exit and PUZZLE areas
-    createWall(-7.5, 13, 15, 'horizontal'); // Wall below top PUZZLE area
-    // createWall(   0, 17.5, 5, 'vertical'); // Short vertical between PUZZLE areas (optional detail)
-    createWall(-7.5, 22, 15, 'horizontal'); // Wall below bottom PUZZLE area
-
-    // Right side structure (jagged parts, leading to bottom ENEMY)
-    createWall(20, 10, 5, 'vertical');     // Vertical down from central passage, right of PUZZLEs
-    createWall(22.5, 13, 5, 'horizontal');
-    createWall(25, 15.5, 5, 'vertical');
-    createWall(22.5, 18, 5, 'horizontal');
-    createWall(20, 20.5, 5, 'vertical');
-
-    // Bottom ENEMY Area
-    createWall(12.5, 18, 15, 'horizontal'); // Top wall of bottom ENEMY
-    createWall(20, 25.5, 15, 'vertical');   // Right wall of bottom ENEMY
-    createWall(12.5, 33, 15, 'horizontal'); // Bottom wall of bottom ENEMY
-    createWall(5, 25.5, 15, 'vertical');     // Left wall of bottom ENEMY
-
-    // Connecting wall from bottom-left of maze to bottom ENEMY
-    createWall(-2.5, 22, 15, 'horizontal'); // Shares with wall below bottom PUZZLE
-                                            // This connection implies the puzzle area is not fully enclosed on the right
-                                            // This may require reviewing the diagram and intention for openings.
-    createWall(5, 17.5, 10, 'vertical');  // vertical wall right of bottom puzzle area connecting down. 
-
-    console.log("Maze built with", walls.length, "wall segments.");
-
-    // Adjust player starting position if needed based on maze
-    // camera.position.set(0, playerHeight, 10); // Example: move further into a potential starting area
-    // Current start (0, playerHeight, 5) might be inside a wall or too cramped. Let's try -12, playerHeight, 0
-    camera.position.set(-12, playerHeight, 0);
-    console.log("Player starting position set to -12,0 within the maze.");
+// Maze generation algorithm (Randomized DFS)
+function generateMaze(size) {
+    // Initialize grid with all walls
+    const grid = Array(size).fill().map(() => Array(size).fill(0));
+    
+    // Create a grid with cell values
+    // 0 = wall, 1 = path
+    
+    // We'll use odd coordinates for walls and even coordinates for cells
+    // Start from a random even coordinate (1, 1) to (size-2, size-2)
+    const startX = 1;
+    const startZ = 1;
+    grid[startX][startZ] = 1; // Mark as path
+    
+    // Using a stack for depth-first traversal
+    const stack = [{x: startX, z: startZ}];
+    
+    // Possible directions to move in the grid [dx, dz]
+    const directions = [
+        [0, -2], // North (move 2 cells to skip walls)
+        [2, 0],  // East
+        [0, 2],  // South
+        [-2, 0]  // West
+    ];
+    
+    while (stack.length > 0) {
+        const current = stack[stack.length - 1];
+        
+        // Find unvisited neighbors (must be at least 2 cells away due to walls)
+        const unvisitedNeighbors = [];
+        
+        for (const [dx, dz] of directions) {
+            const nx = current.x + dx;
+            const nz = current.z + dz;
+            
+            // Check if this neighbor is valid (in bounds and unvisited)
+            if (nx > 0 && nx < size - 1 && nz > 0 && nz < size - 1 && grid[nx][nz] === 0) {
+                unvisitedNeighbors.push({x: nx, z: nz, dx: dx/2, dz: dz/2});
+            }
+        }
+        
+        if (unvisitedNeighbors.length > 0) {
+            // Choose a random unvisited neighbor
+            const next = unvisitedNeighbors[Math.floor(Math.random() * unvisitedNeighbors.length)];
+            
+            // Carve a path to this neighbor by marking the wall in between as a path
+            grid[current.x + next.dx][current.z + next.dz] = 1;
+            
+            // Mark the neighbor cell as a path
+            grid[next.x][next.z] = 1;
+            
+            // Add the neighbor to the stack
+            stack.push({x: next.x, z: next.z});
+        } else {
+            // Backtrack if no unvisited neighbors
+            stack.pop();
+        }
+    }
+    
+    return grid;
 }
 
 function handlePlayerDeath() {
@@ -1670,4 +2040,106 @@ function throwProjectile() {
     tossedProjectileVelocity.multiplyScalar(PROJECTILE_SPEED);
 
     console.log("Projectile thrown!");
+} 
+
+function renderMiniMap() {
+    if (!miniMapContext || !miniMapCanvas) return;
+
+    // Clear the mini-map
+    miniMapContext.fillStyle = 'rgba(0, 0, 0, 0.7)';
+    miniMapContext.fillRect(0, 0, miniMapCanvas.width, miniMapCanvas.height);
+    
+    const mapWidth = miniMapCanvas.width;
+    const mapHeight = miniMapCanvas.height;
+    const centerX = mapWidth / 2;
+    const centerZ = mapHeight / 2;
+
+    // Draw the floor for reference (dark gray)
+    miniMapContext.fillStyle = 'rgba(50, 50, 50, 0.5)';
+    for (const floor of floorSegments) {
+        if (floor.userData && floor.userData.aabb) {
+            const aabb = floor.userData.aabb;
+            const mapX = centerX + aabb.min.x * miniMapScale;
+            const mapZ = centerZ + aabb.min.z * miniMapScale;
+            const width = (aabb.max.x - aabb.min.x) * miniMapScale;
+            const height = (aabb.max.z - aabb.min.z) * miniMapScale;
+            miniMapContext.fillRect(mapX, mapZ, width, height);
+        }
+    }
+
+    // Draw the maze walls (light gray)
+    miniMapContext.fillStyle = 'rgba(200, 200, 200, 0.9)';
+    for (const wall of walls) {
+        if (wall.userData && wall.userData.aabb) {
+            const aabb = wall.userData.aabb;
+            const mapX = centerX + aabb.min.x * miniMapScale;
+            const mapZ = centerZ + aabb.min.z * miniMapScale;
+            const width = (aabb.max.x - aabb.min.x) * miniMapScale;
+            const height = (aabb.max.z - aabb.min.z) * miniMapScale;
+            miniMapContext.fillRect(mapX, mapZ, width, height);
+        }
+    }
+
+    // DEBUGGING: Draw indicators for all valid path cells
+    if (window._debugPathCells && window._debugPathCells.length > 0) {
+        miniMapContext.fillStyle = 'rgba(255, 255, 0, 0.5)'; // Yellow for debug path cells
+        for (const cell of window._debugPathCells) {
+            const cellX = centerX + cell.x * miniMapScale;
+            const cellZ = centerZ + cell.z * miniMapScale;
+            miniMapContext.beginPath();
+            miniMapContext.arc(cellX, cellZ, 3, 0, Math.PI * 2);
+            miniMapContext.fill();
+        }
+    }
+
+    // Draw power-up locations if visible
+    if (powerUpSphereMesh && powerUpSphereMesh.visible) {
+        miniMapContext.fillStyle = 'rgba(255, 0, 0, 1.0)'; // Brighter red for better visibility
+        const powerUpX = centerX + powerUpSphereMesh.position.x * miniMapScale;
+        const powerUpZ = centerZ + powerUpSphereMesh.position.z * miniMapScale;
+        miniMapContext.beginPath();
+        miniMapContext.arc(powerUpX, powerUpZ, 6, 0, Math.PI * 2);
+        miniMapContext.fill();
+    }
+
+    if (projectilePowerUpSphereMesh && projectilePowerUpSphereMesh.visible) {
+        miniMapContext.fillStyle = 'rgba(180, 0, 255, 1.0)'; // Brighter purple for better visibility
+        const projectilePowerUpX = centerX + projectilePowerUpSphereMesh.position.x * miniMapScale;
+        const projectilePowerUpZ = centerZ + projectilePowerUpSphereMesh.position.z * miniMapScale;
+        miniMapContext.beginPath();
+        miniMapContext.arc(projectilePowerUpX, projectilePowerUpZ, 6, 0, Math.PI * 2);
+        miniMapContext.fill();
+    }
+    
+    // Draw player position (cyan circle with direction indicator)
+    if (camera) {
+        const playerX = centerX + camera.position.x * miniMapScale;
+        const playerZ = centerZ + camera.position.z * miniMapScale;
+        
+        // Draw player direction indicator first (behind the player dot)
+        const direction = new THREE.Vector3();
+        camera.getWorldDirection(direction);
+        direction.normalize();
+        
+        miniMapContext.strokeStyle = 'rgba(0, 255, 255, 0.9)';
+        miniMapContext.lineWidth = 2;
+        miniMapContext.beginPath();
+        miniMapContext.moveTo(playerX, playerZ);
+        miniMapContext.lineTo(
+            playerX + direction.x * 15,
+            playerZ + direction.z * 15
+        );
+        miniMapContext.stroke();
+        
+        // Draw player circle on top
+        miniMapContext.fillStyle = 'rgba(0, 255, 255, 1.0)';
+        miniMapContext.beginPath();
+        miniMapContext.arc(playerX, playerZ, 5, 0, Math.PI * 2);
+        miniMapContext.fill();
+    }
+    
+    // Draw border around minimap
+    miniMapContext.strokeStyle = 'rgba(0, 255, 255, 0.7)';
+    miniMapContext.lineWidth = 2;
+    miniMapContext.strokeRect(0, 0, mapWidth, mapHeight);
 } 
