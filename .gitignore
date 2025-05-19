@@ -5,4 +5,20 @@ models/
 *.mp3
 
 # Ignore all .asd files
-*.asd 
+*.asd
+
+# SSL Certificates
+*.pem
+csr.pem
+key.pem
+cert.pem
+
+# Node.js
+node_modules/
+npm-debug.log
+package-lock.json
+
+# OS Files
+.DS_Store
+Thumbs.db
+.vscode/ 

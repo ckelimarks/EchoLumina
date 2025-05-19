@@ -1,0 +1,23 @@
+{
+  "name": "echo-location-vr",
+  "version": "1.0.0",
+  "description": "Echo location game with WebXR support for Oculus Quest 2",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "generate-cert": "openssl genrsa -out key.pem && openssl req -new -key key.pem -out csr.pem && openssl x509 -req -days 365 -in csr.pem -signkey key.pem -out cert.pem"
+  },
+  "keywords": [
+    "webxr",
+    "three.js",
+    "oculus-quest",
+    "vr",
+    "echo-location",
+    "game"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+} 

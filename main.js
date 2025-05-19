@@ -5,10 +5,16 @@ console.log("main.js loaded");
 
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+import { VRButton } from 'three/addons/webxr/VRButton.js'; // Add WebXR VR Button
+import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js'; // Add Controller Models
 
 // Scene, Camera, Renderer
 let scene, camera, renderer;
 let controls;
+// VR-specific variables
+let isInVR = false;
+let controller1, controller2;
+let controllerGrip1, controllerGrip2;
 let playerVelocity = new THREE.Vector3();
 const playerSpeed = 10.0;
 const PLAYER_ACCELERATION = 200.0; // How quickly player reaches max speed (INCREASED)
@@ -28,7 +34,7 @@ let echoableObjects = []; // To store floor, pillars, etc.
 // Particle System for Echo
 let particleSystem;
 const MAX_PARTICLES = 50000; // Max particles in the pool
-const PARTICLES_PER_ECHO = 20000; // INCREASED for denser effect (was 7500)
+const PARTICLES_PER_ECHO = 5000; // REDUCED for quicker echo completion (was 20000)
 
 // Input state
 const keyboardState = {};
@@ -39,14 +45,14 @@ const ECHO_FADE_DURATION = 8.0; // seconds: How long particles take to fade (SLO
 const ECHO_FADE_IN_DURATION = 0.2; // seconds: How long particles take to fade in
 const PROJECTILE_ECHO_PARTICLE_MULTIPLIER = 3.0; // INCREASED: Cast more particles for projectile echos
 
-// NEW: Aftershock Constants
-const AFTERSHOCK_DELAY = 0.3; // seconds: Delay after main pulse before aftershock starts
-const AFTERSHOCK_DURATION = 0.5; // seconds: Duration of the aftershock flare-up effect
-const AFTERSHOCK_MAX_ALPHA_BOOST = 0.65; // Max additional alpha at peak of aftershock (0 to 1)
+// NEW: Aftershock Constants - REMOVED: We're removing aftershock effects
+// const AFTERSHOCK_DELAY = 0.3; // seconds: Delay after main pulse before aftershock starts
+// const AFTERSHOCK_DURATION = 0.5; // seconds: Duration of the aftershock flare-up effect
+// const AFTERSHOCK_MAX_ALPHA_BOOST = 0.65; // Max additional alpha at peak of aftershock (0 to 1)
 
 // NOW DEFINE PARTICLE CONSTANTS THAT DEPEND ON THE ABOVE
 const PARTICLE_INITIAL_LIFE = ECHO_FADE_IN_DURATION + ECHO_HOLD_DURATION + ECHO_FADE_DURATION; // Total lifespan 4.3s
-const PARTICLE_BASE_SIZE = 0.05; 
+const PARTICLE_BASE_SIZE = 0.03; 
 
 // Lifecycle stages (based on life REMAINING)
 const LIFESTAGE_FADEOUT_THRESHOLD = ECHO_FADE_DURATION; // When life <= this, particle is fading out (e.g., 4.0s)
@@ -60,8 +66,8 @@ const DISTANCE_DECAY_RATE_MULTIPLIER = 3.0; // For particles at echo origin, lif
 // Timing
 const clock = new THREE.Clock();
 
-// NEW: Active Aftershocks Array
-let activeAftershocks = [];
+// NEW: Active Aftershocks Array - REMOVED: We're removing aftershock tracking
+// let activeAftershocks = [];
 
 // NEW: Web Audio API Context
 let audioContext;
@@ -179,17 +185,65 @@ let deathTintElement;
 let deathMessageElement;
 
 // NEW: Projectile State
-let tossedProjectileMesh;
-let tossedProjectileVelocity = new THREE.Vector3();
-let isProjectileInFlight = false;
+let tossedProjectileMeshes = []; // Array of projectile meshes
+let tossedProjectileVelocities = []; // Array of velocities
+let projectileCurrentLives = []; // Array of lifetimes
+let isProjectileInFlight = false; // Flag for any projectile in flight
+const MAX_PROJECTILES = 5; // Maximum number of projectiles allowed in flight
 const PROJECTILE_SPEED = 25.0;
 const PROJECTILE_MAX_LIFE = 3.0; // seconds
-let projectileCurrentLife = 0;
 
 // Mini-map variables
 let miniMapCanvas;
 let miniMapContext;
 let miniMapScale = 2.5; // Increased scale for better visibility
+
+// Controller input state
+let vrControllerInputs = {
+    left: {
+        thumbstickX: 0,
+        thumbstickY: 0,
+        thumbstickPressed: false
+    },
+    right: {
+        thumbstickX: 0,
+        thumbstickY: 0,
+        thumbstickPressed: false
+    }
+};
+
+// VR movement constants
+const VR_MOVE_SPEED = 3.0; // Reduced from 10.0 for more comfortable movement
+const VR_TELEPORT_DISTANCE = 5.0; // Units for teleport mode
+const VR_COLLISION_RADIUS = 0.4; // Player collision radius in VR
+
+// NEW: Array to track active impact flashes for guaranteed cleanup
+let activeImpactFlashes = [];
+const MAX_FLASH_AGE = 500; // milliseconds
+
+// NEW: Puzzle Door Constants and State
+let puzzleDoorMesh, puzzleDoorTarget1Mesh, puzzleDoorTarget2Mesh;
+let isPuzzleDoorActive = false; // Is the door challenge currently active (spawned)?
+let isPuzzleDoorTarget1Hit = false;
+let isPuzzleDoorTarget2Hit = false;
+let isPuzzleDoorOpen = false;
+let puzzleDoorSpawnLocation = null; // THREE.Vector3, set by buildMaze
+let puzzleDoorSpawnOrientation = 'horizontal'; // 'horizontal' or 'vertical'
+
+const PUZZLE_DOOR_TARGET_COLOR = new THREE.Color(0x00ff00); // Green
+const PUZZLE_DOOR_TARGET_HIT_COLOR = new THREE.Color(0xffff00); // Yellow
+const PUZZLE_DOOR_PANEL_COLOR = new THREE.Color(0x4a2a00); // Dark wood-like brown
+const PUZZLE_DOOR_FRAME_COLOR = new THREE.Color(0x301c00); // Darker brown for frame
+const DOOR_WIDTH = 4;
+const DOOR_HEIGHT = 6; // Taller than player
+const DOOR_THICKNESS = 0.5;
+const DOOR_TARGET_RADIUS = 0.3;
+const DOOR_TARGET_THICKNESS = 0.1;
+
+// Sounds (to be loaded in init)
+let doorTargetHitSoundBuffer = null;
+let doorOpenSoundBuffer = null;
+// END NEW Puzzle Door
 
 // Function declarations moved BEFORE init()
 
@@ -268,7 +322,11 @@ async function loadAudioBuffer(url) {
     }
 }
 
-// MODIFIED: triggerEcho can now take an origin and color override
+// Add these global variables for progressive particle generation
+let pendingEchoes = []; // Queue of echo requests to process
+const PARTICLES_PER_FRAME = 10000; // GREATLY increased for much faster echo processing
+
+// Modify the triggerEcho function to queue requests instead of processing immediately
 function triggerEcho(originPoint, echoColorOverride) {
     if (isPlayerDead) return;
     if (!audioContext) { 
@@ -279,9 +337,9 @@ function triggerEcho(originPoint, echoColorOverride) {
         audioContext.resume();
     }
 
-    console.log("Particle Echo triggered! Attempting to cast", PARTICLES_PER_ECHO, "rays.");
+    console.log("Echo triggered, queueing particles");
 
-    // Sound Playback Logic
+    // Sound Playback Logic - MOVED to the beginning of the function
     let soundBufferToPlay = null;
     let soundFileName = ""; 
 
@@ -305,6 +363,7 @@ function triggerEcho(originPoint, echoColorOverride) {
         }
     }
 
+    // Play sound immediately before starting particle calculations
     if (soundBufferToPlay) {
         const source = audioContext.createBufferSource();
         source.buffer = soundBufferToPlay;
@@ -314,15 +373,11 @@ function triggerEcho(originPoint, echoColorOverride) {
         console.warn(`Audio buffer for ${soundFileName} not found or not loaded yet.`);
     }
 
-    const origin = originPoint ? originPoint.clone() : camera.position.clone();
-    let particlesActivatedThisEcho = 0;
-
     // Determine number of particles to cast for this specific echo
     let numParticlesToCast = PARTICLES_PER_ECHO;
-    if (echoColorOverride === PROJECTILE_ECHO_PARTICLE_COLOR) {
-        numParticlesToCast = Math.floor(PARTICLES_PER_ECHO * PROJECTILE_ECHO_PARTICLE_MULTIPLIER);
-        console.log(`Projectile echo: Casting ${numParticlesToCast} particles.`);
-    }
+    
+    // SIMPLIFIED: Use same particle count for all echo types for consistency
+    // No special multiplier for projectile echo
 
     // Determine echo particle color and raycaster distance
     let currentEchoColorToUse;
@@ -330,7 +385,7 @@ function triggerEcho(originPoint, echoColorOverride) {
 
     if (echoColorOverride) { // Projectile echo uses its specific color
         currentEchoColorToUse = echoColorOverride;
-        currentRaycasterFar = PROJECTILE_ECHO_RAYCASTER_FAR; // USE new far distance
+        currentRaycasterFar = PROJECTILE_ECHO_RAYCASTER_FAR; 
     } else if (isPowerUpActive) { // Red power-up (shorter range, different particle color)
         currentEchoColorToUse = POWERUP_COLOR; // Red particles for red power-up
         currentRaycasterFar = POWERUP_RAYCASTER_FAR;
@@ -338,31 +393,69 @@ function triggerEcho(originPoint, echoColorOverride) {
         currentEchoColorToUse = NORMAL_ECHO_COLOR;
         currentRaycasterFar = NORMAL_RAYCASTER_FAR;
     }
-    raycaster.far = currentRaycasterFar;
 
+    // Important: Use the originPoint if provided (for projectile impacts)
+    // otherwise default to camera position (for player echos)
+    const echoOrigin = originPoint ? originPoint.clone() : camera.position.clone();
+
+    // Queue the echo for progressive processing
+    pendingEchoes.push({
+        origin: echoOrigin,
+        color: currentEchoColorToUse,
+        raycasterFar: currentRaycasterFar,
+        particlesRemaining: numParticlesToCast,
+        particlesTotal: numParticlesToCast,
+        startIndex: 0,
+        startTime: clock.elapsedTime
+    });
+}
+
+// Add a new function to process echo particles progressively
+function processEchoParticles() {
+    if (pendingEchoes.length === 0) return;
+    
+    // Process the oldest echo request first
+    const echo = pendingEchoes[0];
+    
+    // Set up raycaster with the appropriate distance
+    raycaster.far = echo.raycasterFar;
+    
     const posArray = particleSystem.geometry.attributes.position.array;
     const colArray = particleSystem.geometry.attributes.color.array;
     const sizeArray = particleSystem.geometry.attributes.size.array;
     const lifeArray = particleSystem.geometry.attributes.life.array;
-    const echoDistanceArray = particleSystem.geometry.attributes.echoDistance.array; 
-
-    let affectedParticleIndicesForAftershock = []; // NEW: Collect indices for aftershock
-
-    for (let i = 0; i < numParticlesToCast; i++) {
-        const phi = Math.acos(-1 + (2 * i) / numParticlesToCast);
-        const theta = Math.sqrt(numParticlesToCast * Math.PI) * phi;
+    const echoDistanceArray = particleSystem.geometry.attributes.echoDistance.array;
+    
+    let particlesActivatedThisBatch = 0;
+    
+    // SIMPLIFIED: All echo types process the same number of particles per frame
+    const particlesToProcess = Math.min(PARTICLES_PER_FRAME, echo.particlesRemaining);
+    
+    // Check if this is a projectile echo (purple)
+    const isPurpleEcho = echo.color.equals(PROJECTILE_ECHO_PARTICLE_COLOR);
+    
+    // Process a batch of particles
+    for (let i = 0; i < particlesToProcess; i++) {
+        // Calculate particle index relative to the total for this echo
+        const relativeIndex = echo.startIndex + i;
+        
+        // Generate ray direction using spherical coordinates for even distribution
+        const phi = Math.acos(-1 + (2 * relativeIndex) / echo.particlesTotal);
+        const theta = Math.sqrt(echo.particlesTotal * Math.PI) * phi;
+        
         const direction = new THREE.Vector3(
             Math.cos(theta) * Math.sin(phi),
             Math.sin(theta) * Math.sin(phi),
             Math.cos(phi)
         );
-        raycaster.set(origin, direction);
+        
+        raycaster.set(echo.origin, direction);
         const intersects = raycaster.intersectObjects(echoableObjects, false);
 
         if (intersects.length > 0) {
             const intersection = intersects[0];
             const point = intersection.point;
-            particlesActivatedThisEcho++;
+            particlesActivatedThisBatch++;
             const pIdx = particleIndex % MAX_PARTICLES;
 
             posArray[pIdx * 3 + 0] = point.x;
@@ -370,7 +463,7 @@ function triggerEcho(originPoint, echoColorOverride) {
             posArray[pIdx * 3 + 2] = point.z;
 
             // Determine particle color: special highlight for power-up sphere
-            let finalParticleColor = currentEchoColorToUse;
+            let finalParticleColor = echo.color;
             if (intersection.object === powerUpSphereMesh && powerUpSphereMesh.visible) {
                 finalParticleColor = POWERUP_COLOR; // Highlight with power-up's own red color
             }
@@ -378,46 +471,45 @@ function triggerEcho(originPoint, echoColorOverride) {
             colArray[pIdx * 4 + 0] = finalParticleColor.r;
             colArray[pIdx * 4 + 1] = finalParticleColor.g;
             colArray[pIdx * 4 + 2] = finalParticleColor.b;
-            colArray[pIdx * 4 + 3] = 0.0; 
-
-            sizeArray[pIdx] = 0.0; 
+            
+            // IMPROVED: Start purple projectile particles with higher initial alpha
+            if (isPurpleEcho) {
+                colArray[pIdx * 4 + 3] = 0.6; // Start more visible for projectiles
+                sizeArray[pIdx] = PARTICLE_BASE_SIZE * 1.5; // Slightly larger size for projectile particles
+            } else {
+                // Standard fade-in for other echoes
+                colArray[pIdx * 4 + 3] = 0.0; // Start invisible and fade in
+                sizeArray[pIdx] = 0.0; // Start with zero size and grow
+            }
+            
             lifeArray[pIdx] = PARTICLE_INITIAL_LIFE;
             
-            const distance = point.distanceTo(origin); 
-            echoDistanceArray[pIdx] = distance; 
-            affectedParticleIndicesForAftershock.push(pIdx); // NEW: Add particle index
-
-            // Removed detailed particle activation log for brevity now
-            // if (particlesActivatedThisEcho <= 5) { 
-            //     console.log(`Activated particle in slot ${pIdx}: pos(${point.x.toFixed(2)}, ${point.y.toFixed(2)}, ${point.z.toFixed(2)}), dist: ${distance.toFixed(2)}`);
-            // }
+            const distance = point.distanceTo(echo.origin); 
+            echoDistanceArray[pIdx] = distance;
+            
             particleIndex++;
         }
     }
-    // console.log("Particles activated this echo:", particlesActivatedThisEcho); // Can be spammy
-
-    if (particlesActivatedThisEcho > 0) {
+    
+    // Update echo request
+    echo.startIndex += particlesToProcess;
+    echo.particlesRemaining -= particlesToProcess;
+    
+    // Update buffers if any particles were created
+    if (particlesActivatedThisBatch > 0) {
         particleSystem.geometry.attributes.position.needsUpdate = true;
         particleSystem.geometry.attributes.color.needsUpdate = true;
         particleSystem.geometry.attributes.size.needsUpdate = true;
         particleSystem.geometry.attributes.life.needsUpdate = true; 
         particleSystem.geometry.attributes.echoDistance.needsUpdate = true; 
         particleSystem.geometry.computeBoundingSphere();
-
-        // NEW: Schedule aftershock if particles were activated
-        if (affectedParticleIndicesForAftershock.length > 0) {
-            const aftershockStartTime = clock.elapsedTime + AFTERSHOCK_DELAY;
-            const aftershockEndTime = aftershockStartTime + AFTERSHOCK_DURATION;
-            activeAftershocks.push({
-                startTime: aftershockStartTime,
-                endTime: aftershockEndTime,
-                particleIndices: affectedParticleIndicesForAftershock,
-                maxAlphaBoost: AFTERSHOCK_MAX_ALPHA_BOOST // Could be customized per echo type later
-            });
-        }
     }
-
-    renderer.render(scene, camera);
+    
+    // If this echo is finished, remove from queue
+    if (echo.particlesRemaining <= 0) {
+        // Just remove this echo from the queue
+        pendingEchoes.shift();
+    }
 }
 
 function onWindowResize() {
@@ -447,25 +539,33 @@ function init() {
         console.warn("Mini-map canvas not found.");
     }
 
-    // Scene
+    // Create scene
     scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x000000);
-    // scene.fog = new THREE.Fog(0x000000, 1, 35); // TEMPORARILY DISABLE FOG
-    console.log("Scene fog temporarily disabled for debugging.");
-
-    // Camera
+    
+    // Camera with your original settings
     camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, NORMAL_RAYCASTER_FAR);
     camera.position.set(2, playerHeight, 18); // Start position for maze
-
-    // Renderer
+    
+    // Renderer - maintain original canvas reference and properties
     const canvas = document.getElementById('gameCanvas');
     renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.setPixelRatio(window.devicePixelRatio);
     renderer.setClearColor(0x000000); // Black background
     renderer.shadowMap.enabled = true;
-    document.body.appendChild(renderer.domElement);
-
+    renderer.xr.enabled = true; // Enable WebXR
+    
+    // Add VR button and handle session change events
+    document.body.appendChild(VRButton.createButton(renderer));
+    renderer.xr.addEventListener('sessionstart', () => onVRSessionChange(renderer.xr.getSession()));
+    renderer.xr.addEventListener('sessionend', () => onVRSessionChange(null));
+    
+    // VR-specific variables
+    isInVR = false;
+    
+    // Setup VR controllers
+    setupVRControllers();
+    
     // Basic Ambient Light (very dim)
     const ambientLight = new THREE.AmbientLight(0x050505); // Even dimmer, relying on particles
     scene.add(ambientLight);
@@ -527,17 +627,6 @@ function init() {
 
     // Maze Walls - MOVED after power-up creation
     buildMaze(); // Call function to construct the maze
-
-    // NEW: Create Tossed Projectile Mesh (initially invisible)
-    const tossedProjectileGeom = new THREE.SphereGeometry(0.1, 8, 8); // Made smaller (was 0.2)
-    const tossedProjectileMat = new THREE.MeshStandardMaterial({ 
-        color: PROJECTILE_ECHO_PARTICLE_COLOR, // Use the echo particle color for the projectile itself
-        emissive: PROJECTILE_ECHO_PARTICLE_COLOR,
-        emissiveIntensity: 0.7
-    });
-    tossedProjectileMesh = new THREE.Mesh(tossedProjectileGeom, tossedProjectileMat);
-    tossedProjectileMesh.visible = false; // Start invisible
-    // Not adding to scene yet, will be added when thrown
 
     // Initialize Particle System
     const particleGeometry = new THREE.BufferGeometry();
@@ -692,6 +781,18 @@ function init() {
             });
             allSoundPromises.push(promise);
         });
+
+        // NEW: Load Door Sounds
+        const doorTargetHitSoundPromise = loadAudioBuffer('door_target_hit.mp3').then(buffer => {
+            if (buffer) doorTargetHitSoundBuffer = buffer;
+        });
+        allSoundPromises.push(doorTargetHitSoundPromise);
+
+        const doorOpenSoundPromise = loadAudioBuffer('door_open_sound.mp3').then(buffer => {
+            if (buffer) doorOpenSoundBuffer = buffer;
+        });
+        allSoundPromises.push(doorOpenSoundPromise);
+        // END NEW Door Sounds
 
         // NEW: Load footstep sound
         const footstepSoundPromise = loadAudioBuffer(FOOTSTEP_SOUND_FILE).then(buffer => {
@@ -1184,7 +1285,7 @@ function handlePlayerMovement(deltaTime) {
         }
     }
 
-    // Process Aftershocks
+  /*   // Process Aftershocks
     const currentElapsedTime = clock.elapsedTime;
     const remainingAftershocks = [];
     for (let i = 0; i < activeAftershocks.length; i++) {
@@ -1227,7 +1328,7 @@ function handlePlayerMovement(deltaTime) {
         }
         remainingAftershocks.push(aftershock); // Keep active aftershock
     }
-    activeAftershocks = remainingAftershocks;
+    activeAftershocks = remainingAftershocks; */
 
     if (lifeDataChanged || sizeDataChanged || colorDataChanged) {
         if (lifeDataChanged) particleSystem.geometry.attributes.life.needsUpdate = true;
@@ -1238,16 +1339,37 @@ function handlePlayerMovement(deltaTime) {
     renderer.render(scene, camera);
 }
 
+// Animation loop and render function
 function animate() {
-    requestAnimationFrame(animate);
+    renderer.setAnimationLoop(render);
+}
 
+function render() {
+    const deltaTime = clock.getDelta();
+    
+    // NEW: Clean up any lingering impact flashes
+    const currentTime = Date.now();
+    for (let i = activeImpactFlashes.length - 1; i >= 0; i--) {
+        const flash = activeImpactFlashes[i];
+        const flashAge = currentTime - flash.creationTime;
+        
+        if (flashAge > MAX_FLASH_AGE) {
+            if (flash.mesh.parent) {
+                scene.remove(flash.mesh);
+                console.log("Flash force-removed after maximum age");
+            }
+            activeImpactFlashes.splice(i, 1);
+        }
+    }
+    
     if (isPlayerDead) {
         renderer.render(scene, camera);
-        return; 
+        return;
     }
-
-    const deltaTime = clock.getDelta(); // Define deltaTime ONCE here for the frame
-
+    
+    // Process echo particles progressively
+    processEchoParticles();
+    
     // Power-up Timer (Red power-up)
     if (isPowerUpActive) {
         powerUpRemainingTime -= deltaTime;
@@ -1258,15 +1380,42 @@ function animate() {
             console.log("Red Power-up expired.");
         }
     }
-    // NEW: Timer for Projectile Power-up
+    // Timer for Projectile Power-up
     if (isProjectileEchoPowerUpActive) {
         projectilePowerUpRemainingTime -= deltaTime;
+
+        // NEW: Spawn door when projectile power-up is active and door isn't already active
+        if (!isPuzzleDoorActive && puzzleDoorSpawnLocation) {
+            createPuzzleDoor(puzzleDoorSpawnLocation, puzzleDoorSpawnOrientation);
+        }
+
         if (projectilePowerUpRemainingTime <= 0) {
             isProjectileEchoPowerUpActive = false;
             projectilePowerUpRemainingTime = 0;
             stopBeatSound(); // Stop the beat when purple power-up expires
             if (projectilePowerUpSphereMesh) projectilePowerUpSphereMesh.visible = true;
             console.log("Projectile Power-up expired.");
+
+            // NEW: Despawn door if power-up expires and door is not open
+            if (isPuzzleDoorActive && !isPuzzleDoorOpen) {
+                if (puzzleDoorMesh) scene.remove(puzzleDoorMesh); // This also removes children targets
+                // Remove from echoableObjects is a bit more complex, needs careful handling
+                // For now, direct removal. Consider a helper for removing door + targets from echoableObjects.
+                const doorIndex = echoableObjects.indexOf(puzzleDoorMesh);
+                if (doorIndex > -1) echoableObjects.splice(doorIndex, 1);
+                const target1Index = echoableObjects.indexOf(puzzleDoorTarget1Mesh);
+                if (target1Index > -1) echoableObjects.splice(target1Index, 1);
+                const target2Index = echoableObjects.indexOf(puzzleDoorTarget2Mesh);
+                if (target2Index > -1) echoableObjects.splice(target2Index, 1);
+
+                puzzleDoorMesh = null; // Clear references
+                puzzleDoorTarget1Mesh = null;
+                puzzleDoorTarget2Mesh = null;
+                isPuzzleDoorActive = false;
+                isPuzzleDoorTarget1Hit = false;
+                isPuzzleDoorTarget2Hit = false;
+                console.log("Puzzle door despawned due to power-up expiry.");
+            }
         }
     } else { // If projectile power up is NOT active, ensure beat tracking is reset
         if (beatTrackAudioStartTime !== -1) { // If it was active and now it's not
@@ -1274,86 +1423,271 @@ function animate() {
         }
     }
 
-    // BPM Visual Pulse Detection Logic
-    if (isProjectileEchoPowerUpActive && beatTrackAudioStartTime !== -1 && audioContext) {
-        const elapsedSinceBeatTrackStartMs = (audioContext.currentTime - beatTrackAudioStartTime) * 1000;
-        const currentBeatSlot = Math.floor(elapsedSinceBeatTrackStartMs / BEAT_PULSE_INTERVAL_MS);
+    // Handle movement based on VR state
+    if (isInVR) {
+        // VR movement using controllers
+        handleVRMovement(deltaTime);
 
-        if (currentBeatSlot > lastProcessedBeatCount) {
-            isBeatVisualPulseActive = true;
-            beatVisualPulseEffect_StartTime = audioContext.currentTime;
-            lastProcessedBeatCount = currentBeatSlot;
-            // console.log("Beat pulse triggered for slot:", currentBeatSlot);
-        }
-    }
-
-    // Note: Projectile power-up is a one-time use per pickup for now, no timer. // <<< This comment is now outdated
-
-    handlePlayerMovement(deltaTime); 
-
-    // NEW: Projectile Animation and Collision Logic
-    if (isProjectileInFlight && tossedProjectileMesh) {
-        projectileCurrentLife -= deltaTime;
-
-        // Apply gravity to projectile
-        tossedProjectileVelocity.y -= GRAVITY * deltaTime * 0.5; // Reduced gravity effect for projectile
-        tossedProjectileMesh.position.addScaledVector(tossedProjectileVelocity, deltaTime);
-
-        // Collision detection for projectile
-        const projectileAABB = new THREE.Box3().setFromObject(tossedProjectileMesh);
-        let projectileCollided = false;
-
-        for (const obj of echoableObjects) {
-            // Don't collide with power-up spheres themselves, or if object is invisible
-            if (!obj.visible || obj.userData.isPowerUp || obj.userData.isProjectilePowerUp) {
-                continue; 
-            }
-            if (obj.userData.aabb && projectileAABB.intersectsBox(obj.userData.aabb)) {
-                console.log("Projectile collided with an object!");
-
-                // Move the projectile back slightly along its last path before triggering echo
-                const backwardStep = tossedProjectileVelocity.clone().normalize().multiplyScalar(-0.15); // Small step back
-                tossedProjectileMesh.position.add(backwardStep);
-
-                // Also, move the echo origin slightly up from the impact surface
-                const echoOrigin = tossedProjectileMesh.position.clone();
-                echoOrigin.y += 0.1; // Nudge upwards
-
-                triggerEcho(echoOrigin, PROJECTILE_ECHO_PARTICLE_COLOR);
-                
-                isProjectileInFlight = false;
-                scene.remove(tossedProjectileMesh);
-                tossedProjectileMesh.visible = false;
-                projectileCollided = true;
-
-                // Projectile power-up effect ends on impact - REMOVED - No longer ends power-up on impact
-                // if(isProjectileEchoPowerUpActive) { // This check is still fine, but actions changed
-                //     isProjectileEchoPowerUpActive = false;
-                //     stopBeatSound();
-                //     if (projectilePowerUpSphereMesh) projectilePowerUpSphereMesh.visible = true;
-                //     console.log("Projectile impacted, deactivating power-up and stopping beat.");
-                // }
-                break;
+                // VR Player enters opened puzzle door
+        if (isPuzzleDoorOpen && puzzleDoorSpawnLocation && isPuzzleDoorActive) {
+            const vrPlayerPosition = new THREE.Vector3();
+            camera.getWorldPosition(vrPlayerPosition); // Get VR headset world position
+            const distanceToDoorCenter = vrPlayerPosition.distanceTo(puzzleDoorSpawnLocation);
+            if (distanceToDoorCenter < DOOR_WIDTH / 1.8 && Math.abs(vrPlayerPosition.y - (DOOR_HEIGHT / 2)) < DOOR_HEIGHT / 2) {
+                console.log("VR Player entered the opened puzzle door!");
+                loadNewMaze();
             }
         }
-
-        if (!projectileCollided && projectileCurrentLife <= 0) {
-            console.log("Projectile lifespan expired.");
-            isProjectileInFlight = false;
-            scene.remove(tossedProjectileMesh);
-            tossedProjectileMesh.visible = false;
-            // Optionally trigger an echo where it expired
-            // triggerEcho(tossedProjectileMesh.position.clone(), PROJECTILE_ECHO_PARTICLE_COLOR);
+        
+        // Update VR debug display if available
+        if (vrDebugDisplay && renderer.xr.getSession()) {
+            const session = renderer.xr.getSession();
+            const inputSources = Array.from(session.inputSources);
             
-            // Projectile power-up effect ends on lifespan expiry - REMOVED - No longer ends power-up on expiry
-            // if(isProjectileEchoPowerUpActive) {
-            //     isProjectileEchoPowerUpActive = false;
-            //     stopBeatSound();
-            //     if (projectilePowerUpSphereMesh) projectilePowerUpSphereMesh.visible = true;
-            //     console.log("Projectile expired, deactivating power-up and stopping beat.");
-            // }
+            // Get gamepad data from controllers
+            const leftController = inputSources.find(source => source.handedness === 'left' && source.gamepad);
+            const rightController = inputSources.find(source => source.handedness === 'right' && source.gamepad);
+            
+            const leftAxes = leftController?.gamepad?.axes;
+            const rightAxes = rightController?.gamepad?.axes;
+            
+            // Update the debug display
+            vrDebugDisplay.update(leftAxes, rightAxes);
         }
+        
+        // Update VR mini-map if available
+        if (vrMiniMapTexture) {
+            updateVRMiniMap();
+        }
+        
+
+        // Check for power-up collisions in VR
+        // Get actual camera/headset position in world space
+        const vrCameraPosition = new THREE.Vector3();
+        camera.getWorldPosition(vrCameraPosition);
+        
+        // Collision detection with power-ups in VR
+        if (powerUpSphereMesh && powerUpSphereMesh.visible) {
+            const distance = vrCameraPosition.distanceTo(powerUpSphereMesh.position);
+            if (distance < 1.0) {  // Reasonable collision radius
+                isPowerUpActive = true;
+                powerUpRemainingTime = POWERUP_DURATION;
+                powerUpSphereMesh.visible = false;
+                console.log("Power-up activated in VR!");
+                if (pickupSoundBuffer && audioContext) {
+                    const source = audioContext.createBufferSource();
+                    source.buffer = pickupSoundBuffer;
+                    source.connect(audioContext.destination);
+                    source.start(0);
+                }
+            }
+        }
+        
+        if (projectilePowerUpSphereMesh && projectilePowerUpSphereMesh.visible) {
+            const distance = vrCameraPosition.distanceTo(projectilePowerUpSphereMesh.position);
+            if (distance < 1.0) {  // Reasonable collision radius
+                isProjectileEchoPowerUpActive = true;
+                projectilePowerUpRemainingTime = PROJECTILE_POWERUP_DURATION;
+                projectilePowerUpSphereMesh.visible = false;
+                console.log("Projectile Power-up activated in VR!");
+                scheduleBeatSoundStart(); 
+                if (pickupSoundBuffer && audioContext) {
+                    const source = audioContext.createBufferSource();
+                    source.buffer = pickupSoundBuffer;
+                    source.connect(audioContext.destination);
+                    source.start(0);
+                }
+            }
+        }
+
+        // NEW: VR Player enters opened puzzle door (within render > if (isInVR) block)
+        if (isPuzzleDoorOpen && puzzleDoorSpawnLocation && isPuzzleDoorActive) {
+            // vrCameraPosition is already calculated above for power-up checks and should be up-to-date
+            const distanceToDoorCenter = vrCameraPosition.distanceTo(puzzleDoorSpawnLocation);
+            if (distanceToDoorCenter < DOOR_WIDTH / 1.8 && Math.abs(vrCameraPosition.y - (DOOR_HEIGHT / 2)) < DOOR_HEIGHT / 2) {
+                console.log("VR Player entered the opened puzzle door!");
+                loadNewMaze();
+            }
+        }
+        // END NEW VR Player enters door
+
+    } else {
+        // Regular non-VR controls
+        handlePlayerMovement(deltaTime);
+
+        // NEW: Player enters opened puzzle door (within render > else block for non-VR)
+        if (isPuzzleDoorOpen && puzzleDoorSpawnLocation && isPuzzleDoorActive) {
+            const playerPosition = controls.getObject().position;
+            const distanceToDoorCenter = playerPosition.distanceTo(puzzleDoorSpawnLocation);
+            if (distanceToDoorCenter < DOOR_WIDTH / 1.8 && Math.abs(playerPosition.y - (DOOR_HEIGHT / 2)) < DOOR_HEIGHT / 2) {
+                console.log("Player entered the opened puzzle door!");
+                loadNewMaze();
+            }
+        }
+        // END NEW Player enters door
     }
+    
+    // Projectile Animation and Collision Logic
+    if (isProjectileInFlight) {
+        let activeProjectiles = 0;
+        
+        // Process each projectile
+        for (let i = 0; i < tossedProjectileMeshes.length; i++) {
+            // Skip if this projectile is already dead
+            if (projectileCurrentLives[i] <= 0) continue;
+            
+            // We have at least one active projectile
+            activeProjectiles++;
+            
+            // Update lifetime
+            projectileCurrentLives[i] -= deltaTime;
+            
+            // Apply gravity and move
+            tossedProjectileVelocities[i].y -= GRAVITY * deltaTime * 0.5;
+            tossedProjectileMeshes[i].position.addScaledVector(tossedProjectileVelocities[i], deltaTime);
+            
+            // Check for collisions
+            const projectileAABB = new THREE.Box3().setFromObject(tossedProjectileMeshes[i]);
+            let projectileActuallyHitSomething = false; 
+            
+            for (const obj of echoableObjects) {
+                if (!obj.visible || obj.userData.isPowerUp || obj.userData.isProjectilePowerUp) {
+                    continue;
+                }
+
+                let hitRegisteredInThisLoopIteration = false;
+
+                // Priority 1: Active Puzzle Door Targets
+                if (obj.userData.isDoorTarget && isPuzzleDoorActive && !isPuzzleDoorOpen) {
+                    // Ensure the object's world matrix is up to date for accurate AABB calculation.
+                    obj.updateMatrixWorld(true); 
+                    const targetWorldAABB = new THREE.Box3().setFromObject(obj); // Recalculate AABB in world space on the fly
+
+                    if (targetWorldAABB && projectileAABB.intersectsBox(targetWorldAABB)) { // Use the freshly calculated world AABB
+                        console.log("Projectile intersecting with a door target's AABB (recalculated)...");
+                        let targetSpecificallyHitThisFrame = false;
+                        if (obj.userData.targetId === 1 && !isPuzzleDoorTarget1Hit) {
+                            isPuzzleDoorTarget1Hit = true;
+                            obj.material.color.set(PUZZLE_DOOR_TARGET_HIT_COLOR);
+                            obj.material.emissive.set(PUZZLE_DOOR_TARGET_HIT_COLOR);
+                            console.log("Door Target 1 HIT!");
+                            targetSpecificallyHitThisFrame = true;
+                        } else if (obj.userData.targetId === 2 && !isPuzzleDoorTarget2Hit) {
+                            isPuzzleDoorTarget2Hit = true;
+                            obj.material.color.set(PUZZLE_DOOR_TARGET_HIT_COLOR);
+                            obj.material.emissive.set(PUZZLE_DOOR_TARGET_HIT_COLOR);
+                            console.log("Door Target 2 HIT!");
+                            targetSpecificallyHitThisFrame = true;
+                        }
+
+                        if (targetSpecificallyHitThisFrame) {
+                            if (doorTargetHitSoundBuffer && audioContext) {
+                                const source = audioContext.createBufferSource();
+                                source.buffer = doorTargetHitSoundBuffer;
+                                source.connect(audioContext.destination);
+                                source.start(0);
+                            }
+                            const impactPosition = tossedProjectileMeshes[i].position.clone();
+                            scene.remove(tossedProjectileMeshes[i]);
+                            triggerEcho(impactPosition, PROJECTILE_ECHO_PARTICLE_COLOR);
+                            projectileCurrentLives[i] = 0;
+                            projectileActuallyHitSomething = true;
+                            hitRegisteredInThisLoopIteration = true;
+                        }
+                    }
+                }
+                
+                // Priority 2: Generic Objects (if no target was hit in this iteration)
+                // Also, skip the main door panel if the puzzle is active and the door isn't open yet.
+                if (!hitRegisteredInThisLoopIteration) {
+                    if (obj === puzzleDoorMesh && isPuzzleDoorActive && !isPuzzleDoorOpen) {
+                        // This is the main door panel, puzzle is active & unopen.
+                        // We explicitly do nothing here; projectile passes through the panel itself
+                        // to allow checks against targets which might be further in echoableObjects list
+                        // or if targets were already checked and missed.
+                    } else if (obj.userData.aabb && projectileAABB.intersectsBox(obj.userData.aabb)) {
+                        // Generic collision with any other object,
+                        // OR collision with the puzzleDoorMesh when it's not being skipped (e.g., puzzle inactive or door open).
+                        console.log("Projectile collided with a generic object (or inactive/open door panel)!");
+                        
+                        const impactPosition = tossedProjectileMeshes[i].position.clone();
+                        scene.remove(tossedProjectileMeshes[i]);
+                        
+                        const echoOrigin = impactPosition.clone();
+                        echoOrigin.y += 0.1; 
+                        
+                        console.log("Creating impact flash for generic collision");
+                        const impactFlash = new THREE.Mesh(
+                            new THREE.SphereGeometry(1.0, 8, 8), 
+                            new THREE.MeshBasicMaterial({
+                                color: PROJECTILE_ECHO_PARTICLE_COLOR,
+                                transparent: true,
+                                opacity: 0.7
+                            })
+                        );
+                        impactFlash.position.copy(echoOrigin);
+                        scene.add(impactFlash);
+                        
+                        activeImpactFlashes.push({
+                            mesh: impactFlash,
+                            creationTime: Date.now()
+                        });
+                        
+                        setTimeout(() => {
+                            if (impactFlash.parent) {
+                                scene.remove(impactFlash);
+                                // console.log("Generic impact flash removed by timeout");
+                            }
+                        }, 100); 
+                        
+                        triggerEcho(echoOrigin, PROJECTILE_ECHO_PARTICLE_COLOR);
+                        projectileCurrentLives[i] = 0;
+                        projectileActuallyHitSomething = true;
+                        hitRegisteredInThisLoopIteration = true;
+                    }
+                }
+
+                if (hitRegisteredInThisLoopIteration) {
+                    break; // Projectile hit something, break from 'for (const obj of echoableObjects)'
+                }
+            } // End for (obj of echoableObjects)
+            
+            // Handle projectile expiration if it didn't hit anything
+            if (!projectileActuallyHitSomething && projectileCurrentLives[i] <= 0) {
+                console.log("Projectile lifespan expired.");
+                // Ensure mesh is still in scene before trying to remove
+                if (tossedProjectileMeshes[i] && tossedProjectileMeshes[i].parent) {
+                    scene.remove(tossedProjectileMeshes[i]);
+                }
+            }
+        } // End for (i < tossedProjectileMeshes.length)
+    }
+
+    // NEW: Check and Open Puzzle Door if targets are hit
+    if (isPuzzleDoorActive && !isPuzzleDoorOpen && isPuzzleDoorTarget1Hit && isPuzzleDoorTarget2Hit) {
+        isPuzzleDoorOpen = true;
+        console.log("PUZZLE DOOR OPENED!");
+        if (puzzleDoorMesh) {
+            // "Open" the door - for now, just make it invisible
+            // Later, this could be an animation
+            puzzleDoorMesh.visible = false;
+
+            // Remove targets from echoable objects as they are no longer interactive
+            const target1Index = echoableObjects.indexOf(puzzleDoorTarget1Mesh);
+            if (target1Index > -1) echoableObjects.splice(target1Index, 1);
+            const target2Index = echoableObjects.indexOf(puzzleDoorTarget2Mesh);
+            if (target2Index > -1) echoableObjects.splice(target2Index, 1);
+            // The main door mesh might remain echoable if it has physical presence for entering
+        }
+        if (doorOpenSoundBuffer && audioContext) {
+            const source = audioContext.createBufferSource();
+            source.buffer = doorOpenSoundBuffer;
+            source.connect(audioContext.destination);
+            source.start(0);
+        }
+        // The purple power-up timer (projectilePowerUpRemainingTime) continues. Player has to enter before it runs out.
+    }
+    // END NEW Puzzle Door Open Logic
 
     // Particle animation logic 
     const lifeArray = particleSystem.geometry.attributes.life.array;
@@ -1361,6 +1695,7 @@ function animate() {
     const colArray = particleSystem.geometry.attributes.color.array; 
     const echoDistanceArray = particleSystem.geometry.attributes.echoDistance.array; 
     
+    // Select the appropriate fade duration based on echo type
     const currentDynamicFadeDuration = isPowerUpActive ? POWERUP_ECHO_FADE_DURATION : ECHO_FADE_DURATION; 
     const currentEffectiveRaycasterFar = isPowerUpActive ? POWERUP_RAYCASTER_FAR : NORMAL_RAYCASTER_FAR; 
 
@@ -1377,10 +1712,21 @@ function animate() {
         if (lifeArray[i] > 0) {
             activeParticlesThisFrame++; // Count active particles for main lifecycle processing
 
+            // Check if this is a purple projectile particle
+            const isPurpleParticle = colArray[i * 4 + 0] === PROJECTILE_ECHO_PARTICLE_COLOR.r && 
+                                     colArray[i * 4 + 1] === PROJECTILE_ECHO_PARTICLE_COLOR.g && 
+                                     colArray[i * 4 + 2] === PROJECTILE_ECHO_PARTICLE_COLOR.b;
+            
+            // Apply slower decay rate for purple particles
             const dist = echoDistanceArray[i]; 
             const distanceRatio = Math.min(1.0, dist / currentEffectiveRaycasterFar);
             const invertedDistanceRatio = 1.0 - distanceRatio; 
-            const decayMultiplier = 1.0 + (invertedDistanceRatio * DISTANCE_DECAY_RATE_MULTIPLIER); 
+            
+            // Reduce decay rate for purple particles so they stay visible longer
+            const decayMultiplier = isPurpleParticle
+                ? 1.0 + (invertedDistanceRatio * DISTANCE_DECAY_RATE_MULTIPLIER * 0.7) // 30% slower decay for purple 
+                : 1.0 + (invertedDistanceRatio * DISTANCE_DECAY_RATE_MULTIPLIER);
+                
             const effectiveDeltaTime = deltaTime * decayMultiplier; 
 
             // Update life
@@ -1397,21 +1743,42 @@ function animate() {
                 let effectiveLifeForCurrentFade = rawProgress * currentDynamicFadeDuration;
                 const linearFadeOutProgress = Math.min(1.0, Math.max(0, effectiveLifeForCurrentFade / currentDynamicFadeDuration));
                 const easedFadeOutProgress = Math.sqrt(Math.max(0, linearFadeOutProgress)); 
-                baseAlpha = easedFadeOutProgress;
-                baseSize = PARTICLE_BASE_SIZE * easedFadeOutProgress;
+                
+                // Higher minimum alpha for purple particles during fade out
+                if (isPurpleParticle) {
+                    baseAlpha = Math.max(0.1, easedFadeOutProgress);
+                    baseSize = PARTICLE_BASE_SIZE * 1.5 * easedFadeOutProgress;
+                } else {
+                    baseAlpha = easedFadeOutProgress;
+                    baseSize = PARTICLE_BASE_SIZE * easedFadeOutProgress;
+                }
             } else if (lifeArray[i] <= LIFESTAGE_HOLD_THRESHOLD) { // HOLD
-                baseAlpha = 1.0;
-                baseSize = PARTICLE_BASE_SIZE;
+                // Brighter hold for purple particles
+                if (isPurpleParticle) {
+                    baseAlpha = 1.0;
+                    baseSize = PARTICLE_BASE_SIZE * 1.5; // Larger size for purple particles
+                } else {
+                    baseAlpha = 1.0;
+                    baseSize = PARTICLE_BASE_SIZE;
+                }
             } else { // FADE IN
                 const timeSinceSpawn = PARTICLE_INITIAL_LIFE - lifeArray[i];
                 const linearFadeInProgress = Math.min(1.0, timeSinceSpawn / ECHO_FADE_IN_DURATION);
                 const easedFadeInProgress = easeOutCubic(linearFadeInProgress);
-                baseAlpha = easedFadeInProgress;
-                baseSize = PARTICLE_BASE_SIZE * easedFadeInProgress;
+
+                // Faster fade in for purple particles
+                if (isPurpleParticle) {
+                    // Purple particles start at 60% alpha (from initialization) and go up to 100%
+                    baseAlpha = 0.6 + (easedFadeInProgress * 0.4);
+                    baseSize = PARTICLE_BASE_SIZE * 1.5 * easedFadeInProgress;
+                } else {
+                    baseAlpha = easedFadeInProgress;
+                    baseSize = PARTICLE_BASE_SIZE * easedFadeInProgress;
+                }
             }
         }
 
-        // Set initial attributes based on lifecycle (before aftershock adjustments)
+        // Set attributes based on lifecycle
         if (colArray[i * 4 + 3] !== baseAlpha) {
             colArray[i * 4 + 3] = baseAlpha;
             colorDataChanged = true;
@@ -1422,85 +1789,22 @@ function animate() {
         }
     }
 
-    // Aftershocks - Process after base lifecycle attributes are set for the frame
-    const currentElapsedTime = clock.elapsedTime;
-    const stillActiveAftershocks = [];
-    for (let s = 0; s < activeAftershocks.length; s++) {
-        const aftershock = activeAftershocks[s];
+    // REMOVED: Aftershocks processing
 
-        if (currentElapsedTime < aftershock.startTime) {
-            stillActiveAftershocks.push(aftershock); // Not active yet
-            continue;
-        }
-        if (currentElapsedTime >= aftershock.endTime) {
-            // Aftershock is over, don't keep it.
-            continue;
-        }
-
-        // Aftershock is active
-        const aftershockEffectElapsedTime = currentElapsedTime - aftershock.startTime;
-        const aftershockProgress = aftershockEffectElapsedTime / (aftershock.endTime - aftershock.startTime);
-        const aftershockIntensity = Math.sin(aftershockProgress * Math.PI); // Sine curve for 0 -> 1 -> 0 intensity
-        const currentAlphaBoost = aftershock.maxAlphaBoost * aftershockIntensity;
-
-        for (let p = 0; p < aftershock.particleIndices.length; p++) {
-            const pIdx = aftershock.particleIndices[p];
-            
-            const particleBaseAlphaThisFrame = colArray[pIdx * 4 + 3];
-            let boostedAlpha = particleBaseAlphaThisFrame + currentAlphaBoost;
-
-            if (lifeArray[pIdx] <= 0 && particleBaseAlphaThisFrame === 0.0) {
-                boostedAlpha = currentAlphaBoost * 0.3; // Make aftershock on dead particles much fainter
-            }
-            
-            const finalAlpha = Math.min(1.0, boostedAlpha);
-
-            if (colArray[pIdx * 4 + 3] !== finalAlpha) {
-                colArray[pIdx * 4 + 3] = finalAlpha;
-                colorDataChanged = true; // Ensure flag is set
-            }
-        }
-        stillActiveAftershocks.push(aftershock); // Keep it if it hasn't ended
-    }
-    activeAftershocks = stillActiveAftershocks;
-
-    // NEW: Apply BPM Visual Pulse to alpha (after aftershocks, before final needsUpdate check)
-    if (isBeatVisualPulseActive && audioContext) {
-        const elapsedEffectTimeSec = audioContext.currentTime - beatVisualPulseEffect_StartTime;
-        const effectDurationSec = BEAT_VISUAL_PULSE_EFFECT_DURATION_MS / 1000.0;
-
-        if (elapsedEffectTimeSec < effectDurationSec) {
-            // Calculate pulse intensity (0 -> 1 -> 0 using sine curve over the effect duration)
-            const pulseProgress = elapsedEffectTimeSec / effectDurationSec;
-            // const pulseIntensity = Math.sin(pulseProgress * Math.PI); // Old sine wave
-            const pulseIntensity = 1.0 - pulseProgress; // NEW: Linear decay (sawtooth for the boost effect)
-            const alphaBoost = BEAT_VISUAL_PULSE_MAX_ALPHA_BOOST * pulseIntensity;
-
-            for (let i = 0; i < MAX_PARTICLES; i++) {
-                if (lifeArray[i] > 0) { // Only affect active particles
-                    const currentAlpha = colArray[i * 4 + 3];
-                    const boostedAlpha = Math.min(1.0, currentAlpha + alphaBoost);
-                    if (colArray[i * 4 + 3] !== boostedAlpha) {
-                        colArray[i * 4 + 3] = boostedAlpha;
-                        colorDataChanged = true;
-                    }
-                }
-            }
-        } else {
-            isBeatVisualPulseActive = false; // End of current visual pulse
-        }
-    }
+    // BPM Visual Pulse is now disabled - we retain the normal sonar pulse behavior for all echo types
 
     if (lifeDataChanged || sizeDataChanged || colorDataChanged) {
         if (lifeDataChanged) particleSystem.geometry.attributes.life.needsUpdate = true;
         if (sizeDataChanged) particleSystem.geometry.attributes.size.needsUpdate = true;
         if (colorDataChanged) particleSystem.geometry.attributes.color.needsUpdate = true;
     }
-
+    
+    // Update mini-map only in non-VR mode
+    if (!isInVR) {
+        renderMiniMap();
+    }
+    
     renderer.render(scene, camera);
-
-    // Update the mini-map
-    renderMiniMap();
 }
 
 // Start everything
@@ -1648,7 +1952,10 @@ function buildMaze() {
     };
     
     // Filter out cells that are too close to walls
-    const validPathCells = pathCells.filter(cell => isValidPickupLocation(cell, maze, mazeSize));
+    // const validPathCells = pathCells.filter(cell => isValidPickupLocation(cell, maze, mazeSize)); // OLD STRICT FILTER
+
+    // NEW: Temporarily make all pathCells valid to ensure door placement
+    const validPathCells = [...pathCells]; 
     
     // Store globally for debugging
     window._debugPathCells = validPathCells;
@@ -1827,6 +2134,195 @@ function buildMaze() {
     camera.position.set(PLAYER_START_X, playerHeight, PLAYER_START_Z);
     
     console.log(`Maze built with ${walls.length} wall segments. Player starting at (${PLAYER_START_X}, ${PLAYER_START_Z}).`);
+
+    // NEW: Determine puzzle door spawn location
+    if (validPathCells.length > 2) { // Need at least 3 valid spots for player, 2 powerups, and door
+        // Sort by distance from player start (descending)
+        validPathCells.sort((a, b) => {
+            const distA = Math.hypot(a.x - PLAYER_START_X, a.z - PLAYER_START_Z);
+            const distB = Math.hypot(b.x - PLAYER_START_X, b.z - PLAYER_START_Z);
+            return distB - distA;
+        });
+
+        // Try to find a cell that isn't where power-ups were placed
+        let doorCell = null;
+        for (const cell of validPathCells) {
+            const terlaluDekatDenganRedPowerUp = powerUpSphereMesh && Math.hypot(cell.x - powerUpSphereMesh.position.x, cell.z - powerUpSphereMesh.position.z) < cellSize * 2;
+            const terlaluDekatDenganPurplePowerUp = projectilePowerUpSphereMesh && Math.hypot(cell.x - projectilePowerUpSphereMesh.position.x, cell.z - projectilePowerUpSphereMesh.position.z) < cellSize * 2;
+
+            if (!terlaluDekatDenganRedPowerUp && !terlaluDekatDenganPurplePowerUp) {
+                doorCell = cell;
+                break;
+            }
+        }
+        if (!doorCell) doorCell = validPathCells[0]; // Fallback to farthest if no ideal spot
+
+        puzzleDoorSpawnLocation = new THREE.Vector3(doorCell.x, 0, doorCell.z);
+
+        // Determine orientation (simple logic: if door is more on X-axis end, make it vertical, else horizontal)
+        // This is a heuristic and might need refinement based on maze generation
+        const mazeHalfWidth = (mazeSize * cellSize) / 2;
+        if (Math.abs(doorCell.x) > mazeHalfWidth * 0.7) { // If it's towards the left/right edges
+            puzzleDoorSpawnOrientation = 'vertical'; // Wall along Z, door faces along X
+        } else {
+            puzzleDoorSpawnOrientation = 'horizontal'; // Wall along X, door faces along Z
+        }
+        console.log("Puzzle door spawn location set:", puzzleDoorSpawnLocation, "Orientation:", puzzleDoorSpawnOrientation);
+    } else {
+        puzzleDoorSpawnLocation = null; // Not enough spots to place a door
+        console.warn("Not enough valid path cells to determine puzzle door spawn location.");
+    }
+    // END NEW Puzzle Door Location
+}
+
+// NEW: Function to create the puzzle door and its targets
+function createPuzzleDoor(position, orientation) {
+    // Clear existing door parts if any (e.g., from a previous maze)
+    if (puzzleDoorMesh) scene.remove(puzzleDoorMesh);
+    if (puzzleDoorTarget1Mesh) scene.remove(puzzleDoorTarget1Mesh);
+    if (puzzleDoorTarget2Mesh) scene.remove(puzzleDoorTarget2Mesh);
+
+    // Door Panel
+    const doorPanelGeometry = new THREE.BoxGeometry(DOOR_WIDTH, DOOR_HEIGHT, DOOR_THICKNESS / 2); // Thinner panel
+    const doorPanelMaterial = new THREE.MeshStandardMaterial({ color: PUZZLE_DOOR_PANEL_COLOR, roughness: 0.8, metalness: 0.1 });
+    puzzleDoorMesh = new THREE.Mesh(doorPanelGeometry, doorPanelMaterial);
+    puzzleDoorMesh.position.copy(position);
+    puzzleDoorMesh.position.y = DOOR_HEIGHT / 2; // Sit on the ground
+
+    // Door Frame (simple boxes)
+    const frameThickness = DOOR_THICKNESS;
+    const frameSideGeometry = new THREE.BoxGeometry(frameThickness, DOOR_HEIGHT, frameThickness);
+    const frameTopGeometry = new THREE.BoxGeometry(DOOR_WIDTH + 2 * frameThickness, frameThickness, frameThickness);
+    const frameMaterial = new THREE.MeshStandardMaterial({ color: PUZZLE_DOOR_FRAME_COLOR, roughness: 0.7, metalness: 0.1 });
+
+    const frameLeft = new THREE.Mesh(frameSideGeometry, frameMaterial);
+    frameLeft.position.set(-DOOR_WIDTH / 2 - frameThickness / 2, 0, 0);
+    const frameRight = new THREE.Mesh(frameSideGeometry, frameMaterial);
+    frameRight.position.set(DOOR_WIDTH / 2 + frameThickness / 2, 0, 0);
+    const frameTop = new THREE.Mesh(frameTopGeometry, frameMaterial);
+    frameTop.position.set(0, DOOR_HEIGHT / 2 + frameThickness / 2, 0);
+
+    puzzleDoorMesh.add(frameLeft, frameRight, frameTop); // Add frame parts to the panel mesh for grouping
+
+    // Target 1
+    const targetGeometry = new THREE.CylinderGeometry(DOOR_TARGET_RADIUS, DOOR_TARGET_RADIUS, DOOR_TARGET_THICKNESS, 16);
+    const target1Material = new THREE.MeshStandardMaterial({ color: PUZZLE_DOOR_TARGET_COLOR, emissive: PUZZLE_DOOR_TARGET_COLOR, emissiveIntensity: 0.5 });
+    puzzleDoorTarget1Mesh = new THREE.Mesh(targetGeometry, target1Material);
+    puzzleDoorTarget1Mesh.position.set(-DOOR_WIDTH / 4, DOOR_HEIGHT / 3, DOOR_THICKNESS / 4 + 0.01); // Position on the door panel, slightly forward
+    puzzleDoorTarget1Mesh.rotation.x = Math.PI / 2; // Lay flat on the door
+    puzzleDoorMesh.add(puzzleDoorTarget1Mesh); // Add to door mesh group
+    puzzleDoorTarget1Mesh.userData.isDoorTarget = true;
+    puzzleDoorTarget1Mesh.userData.targetId = 1;
+    puzzleDoorTarget1Mesh.userData.aabb = new THREE.Box3().setFromObject(puzzleDoorTarget1Mesh);
+
+    // Target 2
+    const target2Material = new THREE.MeshStandardMaterial({ color: PUZZLE_DOOR_TARGET_COLOR, emissive: PUZZLE_DOOR_TARGET_COLOR, emissiveIntensity: 0.5 });
+    puzzleDoorTarget2Mesh = new THREE.Mesh(targetGeometry.clone(), target2Material); // Reuse geometry
+    puzzleDoorTarget2Mesh.position.set(DOOR_WIDTH / 4, DOOR_HEIGHT / 3, DOOR_THICKNESS / 4 + 0.01);
+    puzzleDoorTarget2Mesh.rotation.x = Math.PI / 2;
+    puzzleDoorMesh.add(puzzleDoorTarget2Mesh);
+    puzzleDoorTarget2Mesh.userData.isDoorTarget = true;
+    puzzleDoorTarget2Mesh.userData.targetId = 2;
+    puzzleDoorTarget2Mesh.userData.aabb = new THREE.Box3().setFromObject(puzzleDoorTarget2Mesh);
+
+    // Orientation
+    if (orientation === 'vertical') { // Door facing along Z axis
+        puzzleDoorMesh.rotation.y = Math.PI / 2;
+    }
+    // Default is 'horizontal', facing along X, no rotation needed initially for sub-components
+
+    scene.add(puzzleDoorMesh);
+    echoableObjects.push(puzzleDoorMesh, puzzleDoorTarget1Mesh, puzzleDoorTarget2Mesh); 
+
+    // Set AABB for the main door for player collision (to pass through when open)
+    // This AABB should encompass the entire door structure including frame for echo purposes.
+    // For player pass-through logic, we might use a simpler trigger volume or disable collision.
+    puzzleDoorMesh.userData.aabb = new THREE.Box3().setFromObject(puzzleDoorMesh);
+
+    isPuzzleDoorActive = true;
+    isPuzzleDoorTarget1Hit = false;
+    isPuzzleDoorTarget2Hit = false;
+    isPuzzleDoorOpen = false;
+
+    console.log("Puzzle door created at:", position, "Orientation:", orientation);
+}
+
+// NEW: Function to load a new maze
+function loadNewMaze() {
+    console.log("Loading new maze...");
+
+    // 1. Stop sounds (optional, depends on what should carry over)
+    // stopBeatSound(); // Already handled if power-up expires, but good for explicit reset
+
+    // 2. Reset Player State (minimal reset for now, expand as needed)
+    playerVelocity.set(0, 0, 0);
+    playerVerticalVelocity = 0;
+    isJumping = false;
+
+    // 3. Reset Power-up States
+    isPowerUpActive = false;
+    powerUpRemainingTime = 0;
+    if (powerUpSphereMesh) powerUpSphereMesh.visible = true; // Make it reappear
+
+    isProjectileEchoPowerUpActive = false;
+    projectilePowerUpRemainingTime = 0;
+    if (projectilePowerUpSphereMesh) projectilePowerUpSphereMesh.visible = true; // Make it reappear
+    stopBeatSound(); // Ensure beat sound is stopped
+
+    // 4. Reset and Remove Current Door (if it exists and wasn't cleaned up)
+    if (isPuzzleDoorActive || puzzleDoorMesh) {
+        if (puzzleDoorMesh && puzzleDoorMesh.parent) scene.remove(puzzleDoorMesh);
+        
+        // Remove from echoableObjects carefully
+        const doorIdx = echoableObjects.indexOf(puzzleDoorMesh);
+        if (doorIdx > -1) echoableObjects.splice(doorIdx, 1);
+        const target1Idx = echoableObjects.indexOf(puzzleDoorTarget1Mesh);
+        if (target1Idx > -1) echoableObjects.splice(target1Idx, 1);
+        const target2Idx = echoableObjects.indexOf(puzzleDoorTarget2Mesh);
+        if (target2Idx > -1) echoableObjects.splice(target2Idx, 1);
+
+        puzzleDoorMesh = null;
+        puzzleDoorTarget1Mesh = null;
+        puzzleDoorTarget2Mesh = null;
+    }
+    isPuzzleDoorActive = false;
+    isPuzzleDoorTarget1Hit = false;
+    isPuzzleDoorTarget2Hit = false;
+    isPuzzleDoorOpen = false;
+    puzzleDoorSpawnLocation = null; // Will be reset by buildMaze
+
+    // 5. Clear existing maze elements (buildMaze already does this for walls)
+    // If floor or other elements need clearing, do it here.
+    // buildMaze() handles clearing and rebuilding walls.
+
+    // 6. Generate new maze layout and elements
+    buildMaze(); // This will also set new PLAYER_START_X, PLAYER_START_Z and new puzzleDoorSpawnLocation
+
+    // 7. Reset player position to the new maze's start
+    if (controls && controls.isLocked) {
+        // Unlock controls to allow teleport-like position update, then re-lock if desired or let player re-engage
+        // Forcing position while locked can be janky. Best to move the whole controls object.
+        controls.getObject().position.set(PLAYER_START_X, playerHeight, PLAYER_START_Z);
+        camera.position.set(PLAYER_START_X, playerHeight, PLAYER_START_Z);
+    } else {
+        camera.position.set(PLAYER_START_X, playerHeight, PLAYER_START_Z);
+        if(controls) controls.getObject().position.copy(camera.position); // Ensure control object is synced
+    }
+    console.log("Player reset to new maze start:", camera.position);
+
+    // 8. Reset any other relevant game states
+    // (e.g., clear pending echoes, projectiles if desired)
+    pendingEchoes.length = 0;
+    if (particleSystem) {
+       // Optionally reset all particles to inactive/offscreen if visual artifacts occur during transition
+    }
+    tossedProjectileMeshes.forEach(p => scene.remove(p));
+    tossedProjectileMeshes.length = 0;
+    tossedProjectileVelocities.length = 0;
+    projectileCurrentLives.length = 0;
+    isProjectileInFlight = false;
+
+    console.log("New maze loaded and player reset.");
 }
 
 // Maze generation algorithm (Randomized DFS)
@@ -2017,30 +2513,61 @@ function createSegmentedFloorWithPit(totalWidth, totalDepth, pitX, pitZ, pitSize
 
 // NEW: Function to throw projectile
 function throwProjectile() {
-    if (!tossedProjectileMesh || !camera) return;
-
-    isProjectileInFlight = true;
-    projectileCurrentLife = PROJECTILE_MAX_LIFE;
-
-    // Set projectile start position and add to scene
-    tossedProjectileMesh.position.copy(camera.position);
-    // Optional: offset slightly in front of camera so it doesn't spawn inside player
+    if (!camera) return;
+    
+    // Check if we've reached the maximum number of projectiles
+    if (tossedProjectileMeshes.length >= MAX_PROJECTILES) {
+        // Find any dead projectiles and remove them
+        for (let i = tossedProjectileMeshes.length - 1; i >= 0; i--) {
+            if (projectileCurrentLives[i] <= 0) {
+                scene.remove(tossedProjectileMeshes[i]);
+                tossedProjectileMeshes.splice(i, 1);
+                tossedProjectileVelocities.splice(i, 1);
+                projectileCurrentLives.splice(i, 1);
+            }
+        }
+        
+        // If still at max capacity, return
+        if (tossedProjectileMeshes.length >= MAX_PROJECTILES) {
+            console.log(`Maximum projectiles (${MAX_PROJECTILES}) already in flight.`);
+            return;
+        }
+    }
+    
+    // Create a new projectile
+    const tossedProjectileGeom = new THREE.SphereGeometry(0.1, 8, 8);
+    const tossedProjectileMat = new THREE.MeshStandardMaterial({ 
+        color: PROJECTILE_ECHO_PARTICLE_COLOR,
+        emissive: PROJECTILE_ECHO_PARTICLE_COLOR,
+        emissiveIntensity: 0.7
+    });
+    const newProjectile = new THREE.Mesh(tossedProjectileGeom, tossedProjectileMat);
+    
+    // Set projectile start position
+    newProjectile.position.copy(camera.position);
+    // Offset slightly in front of camera so it doesn't spawn inside player
     const offsetDirection = new THREE.Vector3();
     camera.getWorldDirection(offsetDirection);
-    tossedProjectileMesh.position.addScaledVector(offsetDirection, 0.5); 
-
-    scene.add(tossedProjectileMesh);
-    tossedProjectileMesh.visible = true;
-    // REMOVE: isProjectileEchoPowerUpActive = false; 
-    // REMOVE: stopBeatSound(); 
-    // REMOVE: if (projectilePowerUpSphereMesh) { projectilePowerUpSphereMesh.visible = true; }
-
-    // Set projectile velocity
-    camera.getWorldDirection(tossedProjectileVelocity);
-    tossedProjectileVelocity.multiplyScalar(PROJECTILE_SPEED);
-
-    console.log("Projectile thrown!");
-} 
+    newProjectile.position.addScaledVector(offsetDirection, 0.5);
+    
+    // Add to scene
+    scene.add(newProjectile);
+    
+    // Set velocity
+    const newVelocity = new THREE.Vector3();
+    camera.getWorldDirection(newVelocity);
+    newVelocity.multiplyScalar(PROJECTILE_SPEED);
+    
+    // Add to arrays
+    tossedProjectileMeshes.push(newProjectile);
+    tossedProjectileVelocities.push(newVelocity);
+    projectileCurrentLives.push(PROJECTILE_MAX_LIFE);
+    
+    // Set flag
+    isProjectileInFlight = true;
+    
+    console.log(`Projectile thrown! Total projectiles in flight: ${tossedProjectileMeshes.length}`);
+}
 
 function renderMiniMap() {
     if (!miniMapContext || !miniMapCanvas) return;
@@ -2111,6 +2638,52 @@ function renderMiniMap() {
         miniMapContext.fill();
     }
     
+    // Draw puzzle door if active and exists
+    if (isPuzzleDoorActive && puzzleDoorMesh) { 
+        if (puzzleDoorMesh.visible) { // Only draw panel if it's visible
+            miniMapContext.fillStyle = 'rgba(150, 75, 0, 0.8)'; // Brownish for door panel
+            const doorAABB = puzzleDoorMesh.userData.aabb; // Assuming AABB is in world space or accurately reflects world position/size
+            if (doorAABB) {
+                // Convert AABB center and size to map coordinates
+                const doorCenterX = centerX + puzzleDoorMesh.position.x * miniMapScale;
+                const doorCenterZ = centerZ + puzzleDoorMesh.position.z * miniMapScale;
+                const doorWidthOnMap = (puzzleDoorMesh.rotation.y === Math.PI / 2 ? DOOR_THICKNESS : DOOR_WIDTH) * miniMapScale;
+                const doorHeightOnMap = (puzzleDoorMesh.rotation.y === Math.PI / 2 ? DOOR_WIDTH : DOOR_THICKNESS) * miniMapScale; 
+                
+                miniMapContext.save();
+                miniMapContext.translate(doorCenterX, doorCenterZ);
+                miniMapContext.rotate(puzzleDoorMesh.rotation.y); // Align with door's rotation
+                miniMapContext.fillRect(-doorWidthOnMap / 2, -doorHeightOnMap / 2, doorWidthOnMap, doorHeightOnMap);
+                miniMapContext.restore();
+            }
+        }
+
+        // Draw targets if they exist and door is not yet open (and puzzle is active)
+        if (!isPuzzleDoorOpen) {
+            const targetRadiusOnMap = Math.max(1, 2 * miniMapScale * DOOR_TARGET_RADIUS); // Ensure minimum 1px radius
+            if (puzzleDoorTarget1Mesh && puzzleDoorTarget1Mesh.visible) {
+                miniMapContext.fillStyle = isPuzzleDoorTarget1Hit ? 'rgba(255, 255, 0, 1.0)' : 'rgba(0, 255, 0, 1.0)';
+                const target1WorldPos = new THREE.Vector3();
+                puzzleDoorTarget1Mesh.getWorldPosition(target1WorldPos);
+                const target1X = centerX + target1WorldPos.x * miniMapScale;
+                const target1Z = centerZ + target1WorldPos.z * miniMapScale;
+                miniMapContext.beginPath();
+                miniMapContext.arc(target1X, target1Z, targetRadiusOnMap, 0, Math.PI * 2);
+                miniMapContext.fill();
+            }
+            if (puzzleDoorTarget2Mesh && puzzleDoorTarget2Mesh.visible) {
+                miniMapContext.fillStyle = isPuzzleDoorTarget2Hit ? 'rgba(255, 255, 0, 1.0)' : 'rgba(0, 255, 0, 1.0)';
+                const target2WorldPos = new THREE.Vector3();
+                puzzleDoorTarget2Mesh.getWorldPosition(target2WorldPos);
+                const target2X = centerX + target2WorldPos.x * miniMapScale;
+                const target2Z = centerZ + target2WorldPos.z * miniMapScale;
+                miniMapContext.beginPath();
+                miniMapContext.arc(target2X, target2Z, targetRadiusOnMap, 0, Math.PI * 2);
+                miniMapContext.fill();
+            }
+        }
+    }
+    
     // Draw player position (cyan circle with direction indicator)
     if (camera) {
         const playerX = centerX + camera.position.x * miniMapScale;
@@ -2143,3 +2716,772 @@ function renderMiniMap() {
     miniMapContext.lineWidth = 2;
     miniMapContext.strokeRect(0, 0, mapWidth, mapHeight);
 } 
+
+// New function to handle VR controller interactions
+function setupVRControllers() {
+    // Controller 1 (typically left hand)
+    controller1 = renderer.xr.getController(0);
+    controller1.addEventListener('selectstart', onSelectStart);
+    controller1.addEventListener('selectend', onSelectEnd);
+    controller1.addEventListener('squeezestart', onSqueezeStart);
+    controller1.addEventListener('squeezeend', onSqueezeEnd);
+    controller1.addEventListener('connected', (event) => {
+        console.log('Controller 1 connected:', event.data);
+        controller1.gamepad = event.data.gamepad;
+    });
+    controller1.addEventListener('disconnected', () => { 
+        console.log('Controller 1 disconnected');
+        controller1.gamepad = null;
+    });
+    scene.add(controller1);
+
+    // Controller 2 (typically right hand)
+    controller2 = renderer.xr.getController(1);
+    controller2.addEventListener('selectstart', onSelectStart);
+    controller2.addEventListener('selectend', onSelectEnd);
+    controller2.addEventListener('squeezestart', onSqueezeStart);
+    controller2.addEventListener('squeezeend', onSqueezeEnd);
+    controller2.addEventListener('connected', (event) => {
+        console.log('Controller 2 connected:', event.data);
+        controller2.gamepad = event.data.gamepad;
+    });
+    controller2.addEventListener('disconnected', () => { 
+        console.log('Controller 2 disconnected');
+        controller2.gamepad = null;
+    });
+    scene.add(controller2);
+
+    // Controller grips/models
+    const controllerModelFactory = new XRControllerModelFactory();
+
+    controllerGrip1 = renderer.xr.getControllerGrip(0);
+    controllerGrip1.add(controllerModelFactory.createControllerModel(controllerGrip1));
+    scene.add(controllerGrip1);
+
+    controllerGrip2 = renderer.xr.getControllerGrip(1);
+    controllerGrip2.add(controllerModelFactory.createControllerModel(controllerGrip2));
+    scene.add(controllerGrip2);
+    
+    // Add visible rays to controllers
+    const geometry = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(0, 0, 0),
+        new THREE.Vector3(0, 0, -1)
+    ]);
+    geometry.scale(0, 0, -10); // 10 meters long ray
+
+    const lineMaterial = new THREE.LineBasicMaterial({
+        color: 0x00ffff,
+        linewidth: 3 // Note: linewidth only works in WebGL 2
+    });
+
+    const line = new THREE.Line(geometry, lineMaterial);
+    line.name = 'line';
+    line.scale.z = 5;
+
+    controller1.add(line.clone());
+    controller2.add(line.clone());
+    
+    // Set initial visibility based on VR state
+    controller1.visible = false;
+    controller2.visible = false;
+    controllerGrip1.visible = false;
+    controllerGrip2.visible = false;
+}
+
+// Additional controller event handlers
+function onSelectStart(event) {
+    // Get the controller from the event
+    const controller = event.target;
+    
+    // Log controller event for debugging
+    console.log("Select start event on controller:", 
+                controller === controller1 ? "1 (left?)" : "2 (right?)");
+    
+    if (isProjectileEchoPowerUpActive) {
+        // Throw projectile when the trigger is pressed in VR
+        throwProjectileVR(controller);
+    } else {
+        // Test reference space movement
+        if (controller === controller2) { // Right controller
+            const moved = updateReferenceSpace();
+            if (moved) {
+                console.log("Moved using reference space!");
+            }
+        }
+        
+        // Trigger a regular echo
+        const controllerPosition = new THREE.Vector3();
+        controller.getWorldPosition(controllerPosition);
+        
+        // Log echo position
+        console.log("Triggering echo at position:", 
+                   controllerPosition.x.toFixed(2), 
+                   controllerPosition.y.toFixed(2), 
+                   controllerPosition.z.toFixed(2));
+                   
+        triggerEcho(controllerPosition);
+    }
+}
+
+function throwProjectileVR(controller) {
+    if (!isProjectileEchoPowerUpActive) return;
+    
+    // Check if we've reached the maximum number of projectiles
+    if (tossedProjectileMeshes.length >= MAX_PROJECTILES) {
+        // Find any dead projectiles and remove them
+        for (let i = tossedProjectileMeshes.length - 1; i >= 0; i--) {
+            if (projectileCurrentLives[i] <= 0) {
+                scene.remove(tossedProjectileMeshes[i]);
+                tossedProjectileMeshes.splice(i, 1);
+                tossedProjectileVelocities.splice(i, 1);
+                projectileCurrentLives.splice(i, 1);
+            }
+        }
+        
+        // If still at max capacity, return
+        if (tossedProjectileMeshes.length >= MAX_PROJECTILES) {
+            console.log(`Maximum projectiles (${MAX_PROJECTILES}) already in flight.`);
+            return;
+        }
+    }
+    
+    // Get controller position and orientation
+    const controllerPosition = new THREE.Vector3();
+    controller.getWorldPosition(controllerPosition);
+    
+    // Create a direction vector pointing where the controller is pointing
+    const controllerDirection = new THREE.Vector3(0, 0, -1);
+    controllerDirection.applyQuaternion(controller.quaternion);
+    controllerDirection.normalize();
+    
+    // Create projectile at the controller's position
+    const projectileGeometry = new THREE.SphereGeometry(0.1, 8, 8);
+    const projectileMaterial = new THREE.MeshBasicMaterial({ color: PROJECTILE_ECHO_PARTICLE_COLOR });
+    const newProjectile = new THREE.Mesh(projectileGeometry, projectileMaterial);
+    newProjectile.position.copy(controllerPosition);
+    scene.add(newProjectile);
+    
+    // Set velocity in the controller's forward direction
+    const newVelocity = controllerDirection.clone().multiplyScalar(PROJECTILE_SPEED);
+    
+    // Add to arrays
+    tossedProjectileMeshes.push(newProjectile);
+    tossedProjectileVelocities.push(newVelocity);
+    projectileCurrentLives.push(PROJECTILE_MAX_LIFE);
+    
+    // Set flag
+    isProjectileInFlight = true;
+    
+    // Sound effect if available
+    // playProjectileEchoSound(); // Uncomment if this function exists
+    
+    console.log(`VR Projectile thrown! Total projectiles in flight: ${tossedProjectileMeshes.length}`);
+}
+
+function onSelectEnd(event) {
+    // Handle releasing the trigger/select button
+    // Nothing needed for echo effect
+}
+
+// Add VR session change handler
+function onVRSessionChange(session) {
+    isInVR = !!session;
+    console.log("VR session changed:", isInVR ? "Entered VR" : "Exited VR");
+    
+    // Show/hide controllers based on VR state
+    if (controller1 && controller2) {
+        controller1.visible = isInVR;
+        controller2.visible = isInVR;
+        controllerGrip1.visible = isInVR;
+        controllerGrip2.visible = isInVR;
+        
+        // Debug controller state when entering VR
+        if (isInVR) {
+            console.log("Controllers visible. Checking input sources...");
+            
+            // Create debug display when entering VR
+            vrDebugDisplay = createVRDebugDisplay();
+            
+            // Create VR mini-map
+            createVRMiniMap();
+            
+            // Check input sources after a short delay to ensure they're initialized
+            setTimeout(() => {
+                if (session) {
+                    const inputSources = Array.from(session.inputSources);
+                    console.log(`Found ${inputSources.length} input sources`);
+                    
+                    inputSources.forEach((source, i) => {
+                        console.log(`Input source ${i}:`);
+                        console.log(`- Handedness: ${source.handedness}`);
+                        console.log(`- Has gamepad: ${!!source.gamepad}`);
+                        if (source.gamepad) {
+                            console.log(`- Axes count: ${source.gamepad.axes.length}`);
+                            console.log(`- Buttons count: ${source.gamepad.buttons.length}`);
+                        }
+                    });
+                }
+            }, 1000);
+        } else {
+            // Clean up debug display when exiting VR
+            vrDebugDisplay = null;
+            vrMiniMap = null;
+        }
+    }
+    
+    // Handle other VR-specific adjustments
+    if (isInVR) {
+        // Disable pointer lock controls in VR
+        if (controls && controls.isLocked) {
+            controls.unlock();
+        }
+        
+        // Place player at starting position in VR
+        camera.position.set(PLAYER_START_X, playerHeight, PLAYER_START_Z);
+        
+        // Hide reticle in VR
+        if (reticle) reticle.style.display = 'none';
+        
+        // Hide mini-map in VR (optional, you might want to implement a different way to show it)
+        if (miniMapCanvas) miniMapCanvas.style.display = 'none';
+    } else {
+        // Re-enable mouse look when exiting VR
+        if (reticle) reticle.style.display = 'block';
+        if (miniMapCanvas) miniMapCanvas.style.display = 'block';
+        
+        // Re-enable controls for desktop mode
+        setupControls();
+    }
+}
+
+// ... existing code ...
+
+// Additional controller event handlers
+function onSqueezeStart(event) {
+    // Handle grip button press (could be used for teleport mode toggle, etc.)
+    console.log('Squeeze start', event.target === controller1 ? 'left' : 'right');
+}
+
+function onSqueezeEnd(event) {
+    // Handle grip button release
+    console.log('Squeeze end', event.target === controller1 ? 'left' : 'right');
+}
+
+// Handle VR movement
+function handleVRMovement(deltaTime) {
+    if (!isInVR) return;
+    
+    try {
+        // Get the XR session
+        const session = renderer.xr.getSession();
+        if (!session) {
+            return;
+        }
+        
+        // Get input sources and their gamepad data
+        const inputSources = Array.from(session.inputSources);
+        
+        // Find the left controller for movement
+        const leftController = inputSources.find(source => 
+            source.handedness === 'left' && source.gamepad);
+        
+        if (!leftController || !leftController.gamepad) {
+            return; // No left controller with gamepad found
+        }
+        
+        const gamepad = leftController.gamepad;
+        
+        // Based on your debug, Quest 2 left thumbstick uses axes[2] for X and axes[3] for Y
+        let axisX = 0;
+        let axisY = 0;
+        
+        if (gamepad.axes.length >= 4) {
+            axisX = gamepad.axes[2]; 
+            axisY = gamepad.axes[3];
+            
+            // Only continue if there's significant input
+            if (Math.abs(axisX) < 0.2 && Math.abs(axisY) < 0.2) {
+                return;
+            }
+            
+            // Don't invert Y axis as requested by user
+            // axisY = -axisY; // This line is removed to not invert the Y axis
+            
+            // Debug on significant input
+            console.log(`Left stick input: X=${axisX.toFixed(2)}, Y=${axisY.toFixed(2)}`);
+            
+            // Try moving with reference space first (more reliable method on Quest)
+            const movedWithReferenceSpace = movePlayerWithReferenceSpace(axisX, axisY, deltaTime);
+            
+            // If reference space movement failed, fall back to camera rig movement
+            if (!movedWithReferenceSpace) {
+                // Get the camera and rig
+                const xrCamera = renderer.xr.getCamera();
+                if (!xrCamera) {
+                    return;
+                }
+                
+                const cameraRig = xrCamera.parent;
+                if (!cameraRig) {
+                    console.log("No camera rig found!");
+                    return;
+                }
+                
+                // Get movement direction based on headset orientation
+                const headsetDirection = new THREE.Vector3(0, 0, -1); // Forward
+                headsetDirection.applyQuaternion(xrCamera.quaternion);
+                headsetDirection.y = 0; // Keep movement horizontal
+                headsetDirection.normalize();
+                
+                const rightDirection = new THREE.Vector3(1, 0, 0); // Right
+                rightDirection.applyQuaternion(xrCamera.quaternion);
+                rightDirection.y = 0;
+                rightDirection.normalize();
+                
+                // Calculate movement vector
+                const movement = new THREE.Vector3();
+                
+                // Apply forward/backward movement (using Y axis)
+                if (Math.abs(axisY) > 0.2) {
+                    const forwardMagnitude = axisY * VR_MOVE_SPEED * deltaTime * 1.5; // Reduced speed multiplier
+                    movement.addScaledVector(headsetDirection, forwardMagnitude);
+                }
+                
+                // Apply left/right movement (using X axis)
+                if (Math.abs(axisX) > 0.2) {
+                    const rightMagnitude = -axisX * VR_MOVE_SPEED * deltaTime * 1.5; // Negative sign to invert X axis
+                    movement.addScaledVector(rightDirection, rightMagnitude);
+                }
+                
+                // If we have movement to apply
+                if (movement.lengthSq() > 0) {
+                    // Apply movement to the camera rig
+                    cameraRig.position.add(movement);
+                    console.log("Camera rig movement:", movement.x.toFixed(2), movement.z.toFixed(2));
+                    
+                    // Create a red marker at current position for debugging
+                    if (Math.abs(axisX) > 0.7 || Math.abs(axisY) > 0.7) {
+                        const marker = new THREE.Mesh(
+                            new THREE.SphereGeometry(0.05),
+                            new THREE.MeshBasicMaterial({color: 0xff0000})
+                        );
+                        marker.position.copy(cameraRig.position);
+                        marker.position.y = 0; // Place on the ground
+                        scene.add(marker);
+                        
+                        // Remove marker after 2 seconds
+                        setTimeout(() => {
+                            scene.remove(marker);
+                        }, 2000);
+                    }
+                }
+            }
+        }
+    } catch (error) {
+        console.error("Error in handleVRMovement:", error);
+    }
+}
+
+// Add a simpler setup for controllers function
+function setupControls() {
+    if (controls) {
+        controls.addEventListener('lock', () => {
+            console.log('Pointer locked');
+            if (reticle) reticle.style.display = 'block';
+        });
+        
+        controls.addEventListener('unlock', () => {
+            console.log('Pointer unlocked');
+            if (reticle) reticle.style.display = 'none';
+        });
+    } else {
+        console.warn("Controls not available for setup");
+    }
+}
+
+// Add a function to create visual debug for VR controller input
+function createVRDebugDisplay() {
+    // Create a simple canvas for debugging
+    const debugCanvas = document.createElement('canvas');
+    debugCanvas.width = 256;
+    debugCanvas.height = 128;
+    debugCanvas.style.position = 'absolute';
+    debugCanvas.style.bottom = '10px';
+    debugCanvas.style.left = '10px';
+    debugCanvas.style.zIndex = '100';
+    debugCanvas.style.background = 'rgba(0,0,0,0.5)';
+    document.body.appendChild(debugCanvas);
+    
+    const ctx = debugCanvas.getContext('2d');
+    
+    // Create a texture from this canvas
+    const debugTexture = new THREE.CanvasTexture(debugCanvas);
+    
+    // Create a plane to display the debug info in VR
+    const debugPlane = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.2, 0.1),
+        new THREE.MeshBasicMaterial({ 
+            map: debugTexture,
+            transparent: true,
+            opacity: 0.8
+        })
+    );
+    
+    // Attach to the left controller
+    if (controller1) {
+        controller1.add(debugPlane);
+        // Position it above the controller
+        debugPlane.position.set(0, 0.1, -0.05);
+        debugPlane.rotation.x = -Math.PI / 4; // Tilt for better visibility
+    }
+    
+    // Function to update the debug display
+    function updateDebugDisplay(leftAxes, rightAxes) {
+        ctx.clearRect(0, 0, debugCanvas.width, debugCanvas.height);
+        
+        // Background
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, 0, debugCanvas.width, debugCanvas.height);
+        
+        // Draw title
+        ctx.fillStyle = 'white';
+        ctx.font = '16px Arial';
+        ctx.fillText('Controller Input Debug', 10, 20);
+        
+        // Left controller axes
+        ctx.fillStyle = 'cyan';
+        ctx.fillText('Left: ' + (leftAxes ? `X: ${leftAxes[2].toFixed(2)}, Y: ${leftAxes[3].toFixed(2)}` : 'N/A'), 10, 50);
+        
+        // Right controller axes
+        ctx.fillStyle = 'yellow';
+        ctx.fillText('Right: ' + (rightAxes ? `X: ${rightAxes[0].toFixed(2)}, Y: ${rightAxes[1].toFixed(2)}` : 'N/A'), 10, 80);
+        
+        // Update the texture
+        debugTexture.needsUpdate = true;
+    }
+    
+    return {
+        update: updateDebugDisplay,
+        plane: debugPlane
+    };
+}
+
+// Variable to hold debug display
+let vrDebugDisplay = null;
+
+// Create a function to try moving using the XR reference space directly
+function updateReferenceSpace() {
+    if (!isInVR || !renderer.xr.isPresenting) return;
+    
+    try {
+        const referenceSpace = renderer.xr.getReferenceSpace();
+        if (!referenceSpace) {
+            console.log("No reference space available");
+            return false;
+        }
+        
+        console.log("Found reference space:", referenceSpace.type);
+        
+        // Create transform for the offset
+        const transform = new XRRigidTransform(
+            {x: 0, y: 0, z: -0.1}, // Move forward 10cm (hardcoded test)
+            {x: 0, y: 0, z: 0, w: 1}
+        );
+        
+        // Get a new offset reference space
+        const newReferenceSpace = referenceSpace.getOffsetReferenceSpace(transform);
+        
+        // Update the reference space
+        renderer.xr.setReferenceSpace(newReferenceSpace);
+        
+        console.log("Successfully updated reference space");
+        return true;
+    } catch (error) {
+        console.error("Error updating reference space:", error);
+        return false;
+    }
+}
+
+// Create a function to directly move the player using reference space in VR based on controller input
+function movePlayerWithReferenceSpace(xAxis, yAxis, deltaTime) {
+    if (!isInVR || !renderer.xr.isPresenting) return false;
+    
+    try {
+        const referenceSpace = renderer.xr.getReferenceSpace();
+        if (!referenceSpace) {
+            return false;
+        }
+        
+        // Get the camera to determine forward direction
+        const xrCamera = renderer.xr.getCamera();
+        
+        // Get forward and right vectors from camera orientation
+        const forward = new THREE.Vector3(0, 0, -1);
+        forward.applyQuaternion(xrCamera.quaternion);
+        forward.y = 0; // Keep movement horizontal
+        forward.normalize();
+        
+        const right = new THREE.Vector3(1, 0, 0);
+        right.applyQuaternion(xrCamera.quaternion);
+        right.y = 0;
+        right.normalize();
+        
+        // Calculate movement vector
+        const moveVector = new THREE.Vector3();
+        
+        // Apply input (yAxis for forward/back, xAxis for left/right)
+        // Note: we're NOT inverting Y axis now as requested by user
+        if (Math.abs(yAxis) > 0.2) {
+            moveVector.addScaledVector(forward, yAxis * VR_MOVE_SPEED * deltaTime);
+        }
+        
+        // Fix X-axis: Invert X for correct left/right movement
+        if (Math.abs(xAxis) > 0.2) {
+            moveVector.addScaledVector(right, -xAxis * VR_MOVE_SPEED * deltaTime); // Negative sign to invert X axis
+        }
+        
+        // Apply a moderate multiplier for more noticeable movement
+        moveVector.multiplyScalar(2.0); // Reduced from 10 to 2
+        
+        if (moveVector.lengthSq() > 0) {
+            // Create XRRigidTransform for movement
+            const transform = new XRRigidTransform(
+                {x: moveVector.x, y: 0, z: moveVector.z},
+                {x: 0, y: 0, z: 0, w: 1}
+            );
+            
+            // Get new reference space with offset
+            const newReferenceSpace = referenceSpace.getOffsetReferenceSpace(transform);
+            
+            // Update the reference space
+            renderer.xr.setReferenceSpace(newReferenceSpace);
+            
+            // Log movement occasionally but not for every minor movement
+            if (moveVector.length() > 0.05) {
+                console.log("Reference space movement:", moveVector.x.toFixed(2), moveVector.z.toFixed(2));
+            }
+            
+            // Drop a marker to visualize movement (only on significant movement)
+            if (Math.abs(xAxis) > 0.7 || Math.abs(yAxis) > 0.7) {
+                const marker = new THREE.Mesh(
+                    new THREE.SphereGeometry(0.05),
+                    new THREE.MeshBasicMaterial({color: 0x00ff00}) // Green for reference space movement
+                );
+                
+                // Get the current camera position to place the marker
+                const position = new THREE.Vector3();
+                xrCamera.getWorldPosition(position);
+                
+                marker.position.copy(position);
+                marker.position.y = 0; // Place on the ground
+                
+                scene.add(marker);
+                
+                // Remove marker after 2 seconds
+                setTimeout(() => {
+                    scene.remove(marker);
+                }, 2000);
+            }
+            
+            return true;
+        }
+        
+        return false;
+    } catch (error) {
+        console.error("Error moving with reference space:", error);
+        return false;
+    }
+}
+
+// Add VR mini-map functionality
+let vrMiniMap = null;
+let vrMiniMapCanvas = null;
+let vrMiniMapTexture = null;
+
+function createVRMiniMap() {
+    // Create a canvas for the VR mini-map
+    vrMiniMapCanvas = document.createElement('canvas');
+    vrMiniMapCanvas.width = 256;
+    vrMiniMapCanvas.height = 256;
+    const ctx = vrMiniMapCanvas.getContext('2d');
+    
+    // Fill with black background initially
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+    ctx.fillRect(0, 0, vrMiniMapCanvas.width, vrMiniMapCanvas.height);
+    
+    // Create a border
+    ctx.strokeStyle = 'rgba(0, 255, 255, 0.8)';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(3, 3, vrMiniMapCanvas.width - 6, vrMiniMapCanvas.height - 6);
+    
+    // Create texture
+    vrMiniMapTexture = new THREE.CanvasTexture(vrMiniMapCanvas);
+    
+    // Create a plane to display the mini-map in VR
+    const plane = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.15, 0.15), // Smaller size
+        new THREE.MeshBasicMaterial({
+            map: vrMiniMapTexture,
+            transparent: true,
+            opacity: 0.9,
+            side: THREE.DoubleSide
+        })
+    );
+    
+    // Attach to the right controller wrist area
+    if (controller2) {
+        controller2.add(plane);
+        // Position it on top of the controller
+        plane.position.set(0, 0.08, -0.05);
+        plane.rotation.x = -Math.PI / 3; // Angle for better visibility
+        plane.rotation.z = Math.PI; // Flip to be readable
+    }
+    
+    vrMiniMap = plane;
+    return plane;
+}
+
+// Function to update the VR mini-map
+function updateVRMiniMap() {
+    if (!vrMiniMapCanvas || !vrMiniMapTexture || !isInVR) return;
+    
+    const ctx = vrMiniMapCanvas.getContext('2d');
+    
+    // Clear the mini-map
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+    ctx.fillRect(0, 0, vrMiniMapCanvas.width, vrMiniMapCanvas.height);
+    
+    const mapWidth = vrMiniMapCanvas.width;
+    const mapHeight = vrMiniMapCanvas.height;
+    const centerX = mapWidth / 2;
+    const centerZ = mapHeight / 2;
+    
+    // Draw the floor segments (dark gray)
+    ctx.fillStyle = 'rgba(50, 50, 50, 0.5)';
+    for (const floor of floorSegments) {
+        if (floor.userData && floor.userData.aabb) {
+            const aabb = floor.userData.aabb;
+            const mapX = centerX + aabb.min.x * miniMapScale;
+            const mapZ = centerZ + aabb.min.z * miniMapScale;
+            const width = (aabb.max.x - aabb.min.x) * miniMapScale;
+            const height = (aabb.max.z - aabb.min.z) * miniMapScale;
+            ctx.fillRect(mapX, mapZ, width, height);
+        }
+    }
+    
+    // Draw the maze walls (light gray)
+    ctx.fillStyle = 'rgba(200, 200, 200, 0.9)';
+    for (const wall of walls) {
+        if (wall.userData && wall.userData.aabb) {
+            const aabb = wall.userData.aabb;
+            const mapX = centerX + aabb.min.x * miniMapScale;
+            const mapZ = centerZ + aabb.min.z * miniMapScale;
+            const width = (aabb.max.x - aabb.min.x) * miniMapScale;
+            const height = (aabb.max.z - aabb.min.z) * miniMapScale;
+            ctx.fillRect(mapX, mapZ, width, height);
+        }
+    }
+    
+    // Draw power-up locations
+    if (powerUpSphereMesh && powerUpSphereMesh.visible) {
+        ctx.fillStyle = 'rgba(255, 0, 0, 1.0)';
+        const powerUpX = centerX + powerUpSphereMesh.position.x * miniMapScale;
+        const powerUpZ = centerZ + powerUpSphereMesh.position.z * miniMapScale;
+        ctx.beginPath();
+        ctx.arc(powerUpX, powerUpZ, 6, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    
+    if (projectilePowerUpSphereMesh && projectilePowerUpSphereMesh.visible) {
+        ctx.fillStyle = 'rgba(180, 0, 255, 1.0)';
+        const projectilePowerUpX = centerX + projectilePowerUpSphereMesh.position.x * miniMapScale;
+        const projectilePowerUpZ = centerZ + projectilePowerUpSphereMesh.position.z * miniMapScale;
+        ctx.beginPath();
+        ctx.arc(projectilePowerUpX, projectilePowerUpZ, 6, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    
+    // Draw puzzle door if active and exists (for VR minimap)
+    if (isPuzzleDoorActive && puzzleDoorMesh) {
+        if (puzzleDoorMesh.visible) { // Only draw panel if it's visible
+            ctx.fillStyle = 'rgba(150, 75, 0, 0.8)'; // Brownish for door panel
+            // Use main door mesh position and rotation for the panel representation
+            const doorCenterX = centerX + puzzleDoorMesh.position.x * miniMapScale;
+            const doorCenterZ = centerZ + puzzleDoorMesh.position.z * miniMapScale;
+            // Determine width and height on map based on door's orientation
+            const doorWidthOnMap = (puzzleDoorMesh.rotation.y === Math.PI / 2 ? DOOR_THICKNESS : DOOR_WIDTH) * miniMapScale;
+            const doorHeightOnMap = (puzzleDoorMesh.rotation.y === Math.PI / 2 ? DOOR_WIDTH : DOOR_THICKNESS) * miniMapScale;
+
+            ctx.save();
+            ctx.translate(doorCenterX, doorCenterZ);
+            ctx.rotate(puzzleDoorMesh.rotation.y); // Align with door's rotation
+            ctx.fillRect(-doorWidthOnMap / 2, -doorHeightOnMap / 2, doorWidthOnMap, doorHeightOnMap);
+            ctx.restore();
+        }
+
+        // Draw targets if they exist, door is not yet open, and puzzle is active
+        if (!isPuzzleDoorOpen) {
+            const targetRadiusOnMap = Math.max(1, 2 * miniMapScale * DOOR_TARGET_RADIUS); // Ensure minimum 1px radius
+            if (puzzleDoorTarget1Mesh && puzzleDoorTarget1Mesh.visible) {
+                ctx.fillStyle = isPuzzleDoorTarget1Hit ? 'rgba(255, 255, 0, 1.0)' : 'rgba(0, 255, 0, 1.0)';
+                const target1WorldPos = new THREE.Vector3();
+                puzzleDoorTarget1Mesh.getWorldPosition(target1WorldPos);
+                const target1X = centerX + target1WorldPos.x * miniMapScale;
+                const target1Z = centerZ + target1WorldPos.z * miniMapScale;
+                ctx.beginPath();
+                ctx.arc(target1X, target1Z, targetRadiusOnMap, 0, Math.PI * 2);
+                ctx.fill();
+            }
+            if (puzzleDoorTarget2Mesh && puzzleDoorTarget2Mesh.visible) {
+                ctx.fillStyle = isPuzzleDoorTarget2Hit ? 'rgba(255, 255, 0, 1.0)' : 'rgba(0, 255, 0, 1.0)';
+                const target2WorldPos = new THREE.Vector3();
+                puzzleDoorTarget2Mesh.getWorldPosition(target2WorldPos);
+                const target2X = centerX + target2WorldPos.x * miniMapScale;
+                const target2Z = centerZ + target2WorldPos.z * miniMapScale;
+                ctx.beginPath();
+                ctx.arc(target2X, target2Z, targetRadiusOnMap, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+    }
+    
+    // Draw player position with direction indicator
+    const xrCamera = renderer.xr.getCamera();
+    if (xrCamera) {
+        const position = new THREE.Vector3();
+        xrCamera.getWorldPosition(position);
+        
+        const playerX = centerX + position.x * miniMapScale;
+        const playerZ = centerZ + position.z * miniMapScale;
+        
+        // Draw player direction indicator
+        const direction = new THREE.Vector3(0, 0, -1);
+        direction.applyQuaternion(xrCamera.quaternion);
+        direction.normalize();
+        
+        ctx.strokeStyle = 'rgba(0, 255, 255, 0.9)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(playerX, playerZ);
+        ctx.lineTo(
+            playerX + direction.x * 15,
+            playerZ + direction.z * 15
+        );
+        ctx.stroke();
+        
+        // Draw player circle
+        ctx.fillStyle = 'rgba(0, 255, 255, 1.0)';
+        ctx.beginPath();
+        ctx.arc(playerX, playerZ, 5, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    
+    // Draw border around minimap
+    ctx.strokeStyle = 'rgba(0, 255, 255, 0.8)';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(3, 3, mapWidth - 6, mapHeight - 6);
+    
+    // Update the texture
+    vrMiniMapTexture.needsUpdate = true;
+}
+
