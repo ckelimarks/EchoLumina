@@ -78,6 +78,7 @@ const powerUpEchoSoundBuffers = {};
 let fallSoundBuffer; // NEW: Buffer for fall sound
 let pickupSoundBuffer; // NEW: Buffer for pickup sound
 const projectileEchoSoundBuffers = {}; // NEW: Buffers for projectile echo sounds
+let mazeResetSoundBuffer = null; // NEW: Buffer for maze reset sound
 
 // NEW: Footstep Sound Variables
 let footstepSoundBuffer;
@@ -217,6 +218,14 @@ const VR_MOVE_SPEED = 3.0; // Reduced from 10.0 for more comfortable movement
 const VR_TELEPORT_DISTANCE = 5.0; // Units for teleport mode
 const VR_COLLISION_RADIUS = 0.4; // Player collision radius in VR
 
+// NEW: VR Snap Turn Constants and State (Now for Smooth Turn)
+// const VR_SNAP_TURN_ANGLE = Math.PI / 6; // 30 degrees per snap (Snap turn)
+// const VR_SNAP_TURN_THRESHOLD = 0.5;   // Lowered from 0.7 for easier activation (Snap turn)
+// let rightThumbstickReleasedSinceLastSnap = true; // (Snap turn)
+
+const VR_SMOOTH_TURN_SPEED = Math.PI / 4; // Radians per second (e.g., 45 degrees/sec at full stick deflection) - Halved
+const VR_SMOOTH_TURN_DEADZONE = 0.1;   // Stick deflection below this value will be ignored
+
 // NEW: Array to track active impact flashes for guaranteed cleanup
 let activeImpactFlashes = [];
 const MAX_FLASH_AGE = 500; // milliseconds
@@ -228,12 +237,18 @@ let isPuzzleDoorTarget1Hit = false;
 let isPuzzleDoorTarget2Hit = false;
 let isPuzzleDoorOpen = false;
 let puzzleDoorSpawnLocation = null; // THREE.Vector3, set by buildMaze
-let puzzleDoorSpawnOrientation = 'horizontal'; // 'horizontal' or 'vertical'
+let puzzleDoorSpawnNormal = null; // THREE.Vector3, normal door should face, set by buildMaze
+let puzzleDoorSpawnOrientation = 'horizontal'; // 'horizontal' or 'vertical' // Kept for logging or simpler old logic if needed
 
-const PUZZLE_DOOR_TARGET_COLOR = new THREE.Color(0x00ff00); // Green
-const PUZZLE_DOOR_TARGET_HIT_COLOR = new THREE.Color(0xffff00); // Yellow
-const PUZZLE_DOOR_PANEL_COLOR = new THREE.Color(0x4a2a00); // Dark wood-like brown
-const PUZZLE_DOOR_FRAME_COLOR = new THREE.Color(0x301c00); // Darker brown for frame
+const PUZZLE_DOOR_TARGET_COLOR = new THREE.Color(0x00ff00); // Green - Emissive for targets
+const PUZZLE_DOOR_TARGET_HIT_COLOR = new THREE.Color(0xffff00); // Yellow - Emissive for hit targets
+
+// Updated for emissive door
+const PUZZLE_DOOR_EMISSIVE_PANEL_COLOR = new THREE.Color(0x6A0DAD); // Purple for emissive panel
+const PUZZLE_DOOR_EMISSIVE_FRAME_COLOR = new THREE.Color(0x4A007A); // Darker purple for emissive frame
+const PUZZLE_DOOR_BASE_COLOR = new THREE.Color(0x050505); // Very dark base color for the door, so emissive stands out
+const PUZZLE_DOOR_EMISSIVE_INTENSITY = 1.0; // Emissive intensity for the door
+
 const DOOR_WIDTH = 4;
 const DOOR_HEIGHT = 6; // Taller than player
 const DOOR_THICKNESS = 0.5;
@@ -794,6 +809,13 @@ function init() {
         allSoundPromises.push(doorOpenSoundPromise);
         // END NEW Door Sounds
 
+        // NEW: Load Maze Reset Sound
+        const mazeResetSoundPromise = loadAudioBuffer('midradar.mp3').then(buffer => {
+            if (buffer) mazeResetSoundBuffer = buffer;
+        });
+        allSoundPromises.push(mazeResetSoundPromise);
+        // END NEW Maze Reset Sound
+
         // NEW: Load footstep sound
         const footstepSoundPromise = loadAudioBuffer(FOOTSTEP_SOUND_FILE).then(buffer => {
             if (buffer) {
@@ -1346,7 +1368,46 @@ function animate() {
 
 function render() {
     const deltaTime = clock.getDelta();
+    const xrFrame = isInVR ? renderer.xr.getFrame() : null; // Get XRFrame if in VR
     
+    // --- BEGIN VR Input Polling ---
+    if (isInVR) {
+        const session = renderer.xr.getSession();
+        if (session) {
+            for (const source of session.inputSources) {
+                if (source.gamepad) {
+                    // Left Controller (assuming standard mapping)
+                    if (source.handedness === 'left') {
+                        vrControllerInputs.left.thumbstickX = source.gamepad.axes[2] || 0;
+                        vrControllerInputs.left.thumbstickY = source.gamepad.axes[3] || 0;
+                        vrControllerInputs.left.thumbstickPressed = source.gamepad.buttons[3]?.pressed || false; // Index 3 is often thumbstick press
+                    }
+                    // Right Controller (assuming standard mapping)
+                    if (source.handedness === 'right') {
+                        // --- Start Enhanced Debugging for Right Thumbstick Axes ---
+                        if (source.gamepad.axes.length >= 3) { // Check if axes[2] exists before trying to log it
+                            // console.log(`Right Controller Gamepad Raw Axes: [${source.gamepad.axes.join(', ')}]`); 
+                            // More detailed log if the X value seems to be what we expect for snap turning input
+                            if(Math.abs(source.gamepad.axes[2]) > 0.1) { // Only log if there's some movement on expected axis
+                                console.log(`DEBUG VR Input Polling - Right Handed Controller:`);
+                                console.log(`  - Handedness: ${source.handedness}`);
+                                console.log(`  - Gamepad Axes Count: ${source.gamepad.axes.length}`);
+                                console.log(`  - Gamepad Axes Values: [${source.gamepad.axes.map(axis => axis.toFixed(4)).join(', ')}]`);
+                                console.log(`  - Specifically axes[2] (expected turnAxisX): ${source.gamepad.axes[2].toFixed(4)}`)
+                            }
+                        }
+                        // --- End Enhanced Debugging ---
+
+                        vrControllerInputs.right.thumbstickX = source.gamepad.axes[2] || 0;
+                        vrControllerInputs.right.thumbstickY = source.gamepad.axes[3] || 0;
+                        vrControllerInputs.right.thumbstickPressed = source.gamepad.buttons[3]?.pressed || false;
+                    }
+                }
+            }
+        }
+    }
+    // --- END VR Input Polling ---
+
     // NEW: Clean up any lingering impact flashes
     const currentTime = Date.now();
     for (let i = activeImpactFlashes.length - 1; i >= 0; i--) {
@@ -1385,8 +1446,16 @@ function render() {
         projectilePowerUpRemainingTime -= deltaTime;
 
         // NEW: Spawn door when projectile power-up is active and door isn't already active
-        if (!isPuzzleDoorActive && puzzleDoorSpawnLocation) {
-            createPuzzleDoor(puzzleDoorSpawnLocation, puzzleDoorSpawnOrientation);
+        if (!isPuzzleDoorActive && puzzleDoorSpawnLocation && puzzleDoorSpawnNormal) { // Check for normal too
+            // Player position is no longer needed for door orientation.
+            // let playerPosForDoorTargeting;
+            // if (isInVR) {
+            //     playerPosForDoorTargeting = new THREE.Vector3();
+            //     camera.getWorldPosition(playerPosForDoorTargeting); // Get VR headset world position
+            // } else {
+            //     playerPosForDoorTargeting = controls.getObject().position.clone(); // Use a clone to be safe
+            // }
+            createPuzzleDoor(puzzleDoorSpawnLocation, puzzleDoorSpawnNormal); // Pass the pre-calculated normal
         }
 
         if (projectilePowerUpRemainingTime <= 0) {
@@ -1426,9 +1495,9 @@ function render() {
     // Handle movement based on VR state
     if (isInVR) {
         // VR movement using controllers
-        handleVRMovement(deltaTime);
+        handleVRMovement(deltaTime, xrFrame); // Pass xrFrame
 
-                // VR Player enters opened puzzle door
+        // VR Player enters opened puzzle door
         if (isPuzzleDoorOpen && puzzleDoorSpawnLocation && isPuzzleDoorActive) {
             const vrPlayerPosition = new THREE.Vector3();
             camera.getWorldPosition(vrPlayerPosition); // Get VR headset world position
@@ -1513,7 +1582,7 @@ function render() {
 
     } else {
         // Regular non-VR controls
-        handlePlayerMovement(deltaTime);
+        handlePlayerMovement(deltaTime); // No xrFrame needed for non-VR
 
         // NEW: Player enters opened puzzle door (within render > else block for non-VR)
         if (isPuzzleDoorOpen && puzzleDoorSpawnLocation && isPuzzleDoorActive) {
@@ -1670,7 +1739,14 @@ function render() {
         if (puzzleDoorMesh) {
             // "Open" the door - for now, just make it invisible
             // Later, this could be an animation
-            puzzleDoorMesh.visible = false;
+            puzzleDoorMesh.visible = false; // Keep it invisible as per current logic
+
+            // Change the panel's emissive color to green to indicate it's active/unlocked but still part of the puzzle aesthetic
+            if (puzzleDoorMesh.material) { // Ensure material exists
+                puzzleDoorMesh.material.emissive.set(PUZZLE_DOOR_TARGET_COLOR); // Change to green
+                // puzzleDoorMesh.material.emissiveIntensity remains PUZZLE_DOOR_EMISSIVE_INTENSITY or could be adjusted
+                console.log("Puzzle door panel emissive color changed to green.");
+            }
 
             // Remove targets from echoable objects as they are no longer interactive
             const target1Index = echoableObjects.indexOf(puzzleDoorTarget1Mesh);
@@ -2136,47 +2212,117 @@ function buildMaze() {
     console.log(`Maze built with ${walls.length} wall segments. Player starting at (${PLAYER_START_X}, ${PLAYER_START_Z}).`);
 
     // NEW: Determine puzzle door spawn location
-    if (validPathCells.length > 2) { // Need at least 3 valid spots for player, 2 powerups, and door
-        // Sort by distance from player start (descending)
-        validPathCells.sort((a, b) => {
-            const distA = Math.hypot(a.x - PLAYER_START_X, a.z - PLAYER_START_Z);
-            const distB = Math.hypot(b.x - PLAYER_START_X, b.z - PLAYER_START_Z);
-            return distB - distA;
-        });
+    // ---- START OF MODIFIED SECTION FOR DOOR SPAWNING ----
+    puzzleDoorSpawnLocation = null; // Reset before finding a new one
+    puzzleDoorSpawnOrientation = 'horizontal'; // Default, will be refined or made obsolete
 
-        // Try to find a cell that isn't where power-ups were placed
-        let doorCell = null;
-        for (const cell of validPathCells) {
-            const terlaluDekatDenganRedPowerUp = powerUpSphereMesh && Math.hypot(cell.x - powerUpSphereMesh.position.x, cell.z - powerUpSphereMesh.position.z) < cellSize * 2;
-            const terlaluDekatDenganPurplePowerUp = projectilePowerUpSphereMesh && Math.hypot(cell.x - projectilePowerUpSphereMesh.position.x, cell.z - projectilePowerUpSphereMesh.position.z) < cellSize * 2;
+    let candidateDoorLocations = [];
+    const doorWidthThreshold = DOOR_WIDTH; // Ensure wall segment can fit the door (currently cellSize based walls are fine)
 
-            if (!terlaluDekatDenganRedPowerUp && !terlaluDekatDenganPurplePowerUp) {
-                doorCell = cell;
-                break;
+    for (const pathCell of pathCells) {
+        const px = pathCell.gridX;
+        const pz = pathCell.gridZ;
+        const worldPathX = pathCell.x; // Center of path cell
+        const worldPathZ = pathCell.z; // Center of path cell
+
+        // Neighbors: dx, dz, normal of wall surface (pointing INTO path cell), initial rotation for door mesh
+        const neighbors = [
+            // Wall to North of path cell, door faces South (towards path cell)
+            { dx:  0, dz: -1, side: 'N', normal: new THREE.Vector3(0, 0,  1) },
+            // Wall to East of path cell, door faces West (towards path cell)
+            { dx:  1, dz:  0, side: 'E', normal: new THREE.Vector3(-1, 0, 0) },
+            // Wall to South of path cell, door faces North (towards path cell)
+            { dx:  0, dz:  1, side: 'S', normal: new THREE.Vector3(0, 0, -1) },
+            // Wall to West of path cell, door faces East (towards path cell)
+            { dx: -1, dz:  0, side: 'W', normal: new THREE.Vector3(1, 0,  0) }
+        ];
+
+        for (const n of neighbors) {
+            const wx = px + n.dx;
+            const wz = pz + n.dz;
+
+            if (wx >= 0 && wx < mazeSize && wz >= 0 && wz < mazeSize && maze[wx][wz] === 0) { // If neighbor is a wall
+                // Calculate door position: on the surface between pathCell and wallCell
+                // Offset by normal * DOOR_THICKNESS / 2 would be more precise if door origin is center
+                // For now, door position is on the shared edge.
+                let doorPosX = worldPathX + n.dx * (cellSize / 2);
+                let doorPosZ = worldPathZ + n.dz * (cellSize / 2);
+                
+                // The door's main panel has thickness DOOR_THICKNESS/2.
+                // To place it on the surface, we might need to adjust slightly by its normal if its origin is its center.
+                // The createPuzzleDoor places the mesh at `position` and its depth is DOOR_THICKNESS/2
+                // So, `position` should be the very surface.
+
+                candidateDoorLocations.push({
+                    position: new THREE.Vector3(doorPosX, DOOR_HEIGHT / 2, doorPosZ),
+                    normal: n.normal.clone(), // Normal of the wall surface, pointing into the path cell
+                    pathCellGrid: { x: px, z: pz }, // Grid coords of the path cell it opens into
+                    wallCellGrid: { x: wx, z: wz }  // Grid coords of the wall cell it's on
+                });
             }
         }
-        if (!doorCell) doorCell = validPathCells[0]; // Fallback to farthest if no ideal spot
-
-        puzzleDoorSpawnLocation = new THREE.Vector3(doorCell.x, 0, doorCell.z);
-
-        // Determine orientation (simple logic: if door is more on X-axis end, make it vertical, else horizontal)
-        // This is a heuristic and might need refinement based on maze generation
-        const mazeHalfWidth = (mazeSize * cellSize) / 2;
-        if (Math.abs(doorCell.x) > mazeHalfWidth * 0.7) { // If it's towards the left/right edges
-            puzzleDoorSpawnOrientation = 'vertical'; // Wall along Z, door faces along X
-        } else {
-            puzzleDoorSpawnOrientation = 'horizontal'; // Wall along X, door faces along Z
-        }
-        console.log("Puzzle door spawn location set:", puzzleDoorSpawnLocation, "Orientation:", puzzleDoorSpawnOrientation);
-    } else {
-        puzzleDoorSpawnLocation = null; // Not enough spots to place a door
-        console.warn("Not enough valid path cells to determine puzzle door spawn location.");
     }
-    // END NEW Puzzle Door Location
+
+    if (candidateDoorLocations.length > 0) {
+        // Filter out candidates too close to powerups
+        const MIN_DIST_DOOR_POWERUP = cellSize * 2.5; // Minimum distance from door to any power-up
+        let suitableCandidates = candidateDoorLocations.filter(loc => {
+            const tooCloseToRed = powerUpSphereMesh && powerUpSphereMesh.visible &&
+                                  loc.position.distanceTo(powerUpSphereMesh.position) < MIN_DIST_DOOR_POWERUP;
+            const tooCloseToPurple = projectilePowerUpSphereMesh && projectilePowerUpSphereMesh.visible &&
+                                     loc.position.distanceTo(projectilePowerUpSphereMesh.position) < MIN_DIST_DOOR_POWERUP;
+            return !tooCloseToRed && !tooCloseToPurple;
+        });
+
+        if (suitableCandidates.length === 0 && candidateDoorLocations.length > 0) {
+            console.warn("All candidate door locations were too close to powerups. Using original list for random selection, but still preferring farther spots.");
+            // Fallback: use all candidates, but they will still be sorted by distance later.
+            suitableCandidates = [...candidateDoorLocations]; 
+        }
+
+        if (suitableCandidates.length > 0) {
+            // Sort all suitable candidates by distance from player start (farthest first)
+            // This helps if we want to bias, but a pure random pick from this sorted list also works for variety.
+            suitableCandidates.sort((a, b) => {
+                const distA = Math.hypot(a.position.x - PLAYER_START_X, a.position.z - PLAYER_START_Z);
+                const distB = Math.hypot(b.position.x - PLAYER_START_X, b.position.z - PLAYER_START_Z);
+                return distB - distA; // Farthest from player first
+            });
+
+            // Pick a RANDOM candidate from the suitable (and sorted) list
+            const randomIndex = Math.floor(Math.random() * suitableCandidates.length);
+            const chosenDoorCandidate = suitableCandidates[randomIndex];
+            
+            puzzleDoorSpawnLocation = chosenDoorCandidate.position.clone();
+            puzzleDoorSpawnNormal = chosenDoorCandidate.normal.clone(); // Set the facing normal
+
+            // Determine a general orientation string for logging or other simple logic if needed
+            if (Math.abs(chosenDoorCandidate.normal.x) > Math.abs(chosenDoorCandidate.normal.z)) {
+                 puzzleDoorSpawnOrientation = 'vertical'; 
+            } else {
+                 puzzleDoorSpawnOrientation = 'horizontal'; 
+            }
+            console.log("New puzzle door spawn location (randomly selected from suitable) SET:", puzzleDoorSpawnLocation, "Facing Normal:", puzzleDoorSpawnNormal, "Implied Orientation:", puzzleDoorSpawnOrientation);
+            // console.log("Chosen door candidate details:", chosenDoorCandidate); 
+
+        } else {
+            // This case implies candidateDoorLocations was empty to begin with.
+            console.warn("No suitable candidate door locations found (original list was also empty or became empty).");
+            puzzleDoorSpawnLocation = null;
+            puzzleDoorSpawnNormal = null; // Reset normal
+        }
+
+    } else {
+        console.warn("No candidate wall surfaces found for puzzle door placement.");
+        puzzleDoorSpawnLocation = null;
+        puzzleDoorSpawnNormal = null; // Reset normal
+    }
+    // ---- END OF MODIFIED SECTION FOR DOOR SPAWNING ----
+    // END NEW Puzzle Door Location (Note: original comment "END NEW Puzzle Door Location" might be slightly misplaced now)
 }
 
 // NEW: Function to create the puzzle door and its targets
-function createPuzzleDoor(position, orientation) {
+function createPuzzleDoor(position, facingNormal) { // Changed signature: targetToFace -> facingNormal
     // Clear existing door parts if any (e.g., from a previous maze)
     if (puzzleDoorMesh) scene.remove(puzzleDoorMesh);
     if (puzzleDoorTarget1Mesh) scene.remove(puzzleDoorTarget1Mesh);
@@ -2184,7 +2330,14 @@ function createPuzzleDoor(position, orientation) {
 
     // Door Panel
     const doorPanelGeometry = new THREE.BoxGeometry(DOOR_WIDTH, DOOR_HEIGHT, DOOR_THICKNESS / 2); // Thinner panel
-    const doorPanelMaterial = new THREE.MeshStandardMaterial({ color: PUZZLE_DOOR_PANEL_COLOR, roughness: 0.8, metalness: 0.1 });
+    const doorPanelMaterial = new THREE.MeshStandardMaterial({ 
+        color: PUZZLE_DOOR_BASE_COLOR, // Use base color for the main color
+        roughness: 0.8, 
+        metalness: 0.1, 
+        emissive: PUZZLE_DOOR_EMISSIVE_PANEL_COLOR, // Emissive color for glow
+        emissiveIntensity: PUZZLE_DOOR_EMISSIVE_INTENSITY,
+        side: THREE.DoubleSide // Ensure both sides are rendered
+    });
     puzzleDoorMesh = new THREE.Mesh(doorPanelGeometry, doorPanelMaterial);
     puzzleDoorMesh.position.copy(position);
     puzzleDoorMesh.position.y = DOOR_HEIGHT / 2; // Sit on the ground
@@ -2193,50 +2346,96 @@ function createPuzzleDoor(position, orientation) {
     const frameThickness = DOOR_THICKNESS;
     const frameSideGeometry = new THREE.BoxGeometry(frameThickness, DOOR_HEIGHT, frameThickness);
     const frameTopGeometry = new THREE.BoxGeometry(DOOR_WIDTH + 2 * frameThickness, frameThickness, frameThickness);
-    const frameMaterial = new THREE.MeshStandardMaterial({ color: PUZZLE_DOOR_FRAME_COLOR, roughness: 0.7, metalness: 0.1 });
+    const frameMaterial = new THREE.MeshStandardMaterial({ 
+        color: PUZZLE_DOOR_BASE_COLOR, // Use base color for the main color
+        roughness: 0.7, 
+        metalness: 0.1, 
+        emissive: PUZZLE_DOOR_EMISSIVE_FRAME_COLOR, // Emissive color for glow
+        emissiveIntensity: PUZZLE_DOOR_EMISSIVE_INTENSITY,
+        side: THREE.DoubleSide // Ensure both sides are rendered
+    });
 
     const frameLeft = new THREE.Mesh(frameSideGeometry, frameMaterial);
-    frameLeft.position.set(-DOOR_WIDTH / 2 - frameThickness / 2, 0, 0);
+    frameLeft.position.set(-DOOR_WIDTH / 2 - frameThickness / 2, 0, 0); // Relative to door panel
     const frameRight = new THREE.Mesh(frameSideGeometry, frameMaterial);
-    frameRight.position.set(DOOR_WIDTH / 2 + frameThickness / 2, 0, 0);
+    frameRight.position.set(DOOR_WIDTH / 2 + frameThickness / 2, 0, 0); // Relative to door panel
     const frameTop = new THREE.Mesh(frameTopGeometry, frameMaterial);
-    frameTop.position.set(0, DOOR_HEIGHT / 2 + frameThickness / 2, 0);
+    frameTop.position.set(0, DOOR_HEIGHT / 2 + frameThickness / 2, 0); // Relative to door panel
 
     puzzleDoorMesh.add(frameLeft, frameRight, frameTop); // Add frame parts to the panel mesh for grouping
 
     // Target 1
+    // Targets are positioned relative to the puzzleDoorMesh. Their front is along door's local +Z.
     const targetGeometry = new THREE.CylinderGeometry(DOOR_TARGET_RADIUS, DOOR_TARGET_RADIUS, DOOR_TARGET_THICKNESS, 16);
     const target1Material = new THREE.MeshStandardMaterial({ color: PUZZLE_DOOR_TARGET_COLOR, emissive: PUZZLE_DOOR_TARGET_COLOR, emissiveIntensity: 0.5 });
     puzzleDoorTarget1Mesh = new THREE.Mesh(targetGeometry, target1Material);
-    puzzleDoorTarget1Mesh.position.set(-DOOR_WIDTH / 4, DOOR_HEIGHT / 3, DOOR_THICKNESS / 4 + 0.01); // Position on the door panel, slightly forward
-    puzzleDoorTarget1Mesh.rotation.x = Math.PI / 2; // Lay flat on the door
+    // Position on the door panel, slightly forward from its surface (local Z)
+    puzzleDoorTarget1Mesh.position.set(-DOOR_WIDTH / 4, DOOR_HEIGHT / 3, (DOOR_THICKNESS / 2) / 2 + DOOR_TARGET_THICKNESS / 2 + 0.01);
+    puzzleDoorTarget1Mesh.rotation.x = Math.PI / 2; // Lay flat on the door (targets are cylinders, rotate to face out)
     puzzleDoorMesh.add(puzzleDoorTarget1Mesh); // Add to door mesh group
     puzzleDoorTarget1Mesh.userData.isDoorTarget = true;
     puzzleDoorTarget1Mesh.userData.targetId = 1;
-    puzzleDoorTarget1Mesh.userData.aabb = new THREE.Box3().setFromObject(puzzleDoorTarget1Mesh);
+    puzzleDoorTarget1Mesh.userData.aabb = new THREE.Box3().setFromObject(puzzleDoorTarget1Mesh); // AABB in local space of target, then transformed
 
     // Target 2
     const target2Material = new THREE.MeshStandardMaterial({ color: PUZZLE_DOOR_TARGET_COLOR, emissive: PUZZLE_DOOR_TARGET_COLOR, emissiveIntensity: 0.5 });
     puzzleDoorTarget2Mesh = new THREE.Mesh(targetGeometry.clone(), target2Material); // Reuse geometry
-    puzzleDoorTarget2Mesh.position.set(DOOR_WIDTH / 4, DOOR_HEIGHT / 3, DOOR_THICKNESS / 4 + 0.01);
+    puzzleDoorTarget2Mesh.position.set(DOOR_WIDTH / 4, DOOR_HEIGHT / 3, (DOOR_THICKNESS / 2) / 2 + DOOR_TARGET_THICKNESS / 2 + 0.01);
     puzzleDoorTarget2Mesh.rotation.x = Math.PI / 2;
     puzzleDoorMesh.add(puzzleDoorTarget2Mesh);
     puzzleDoorTarget2Mesh.userData.isDoorTarget = true;
     puzzleDoorTarget2Mesh.userData.targetId = 2;
     puzzleDoorTarget2Mesh.userData.aabb = new THREE.Box3().setFromObject(puzzleDoorTarget2Mesh);
 
-    // Orientation
-    if (orientation === 'vertical') { // Door facing along Z axis
-        puzzleDoorMesh.rotation.y = Math.PI / 2;
+    // --- NEW ORIENTATION LOGIC ---
+    // The door panel geometry is created such that its "face" (where targets are placed, local +Z of the panel) 
+    // should point towards the targetToFace (player).
+    // The puzzleDoorMesh itself is positioned at `position`.
+    // We make the door look at the player's XZ position, maintaining its own Y position for the lookAt target.
+    // const lookAtTarget = new THREE.Vector3(targetToFace.x, puzzleDoorMesh.position.y, targetToFace.z);
+    // puzzleDoorMesh.lookAt(lookAtTarget);
+    // The .lookAt() method orients the object's local positive Z axis towards the target.
+    // Since targets are placed on the local +Z face of doorPanelGeometry, this should correctly orient them.
+    // --- END NEW ORIENTATION LOGIC ---
+
+    // --- NEW ORIENTATION LOGIC BASED ON NORMAL (to align with grid) ---
+    if (facingNormal) {
+        if (Math.abs(facingNormal.x) > 0.9) { // Facing primarily along X-axis
+            if (facingNormal.x > 0) { // Facing +X (East)
+                puzzleDoorMesh.rotation.y = Math.PI / 2;
+            } else { // Facing -X (West)
+                puzzleDoorMesh.rotation.y = -Math.PI / 2;
+            }
+        } else if (Math.abs(facingNormal.z) > 0.9) { // Facing primarily along Z-axis
+            if (facingNormal.z > 0) { // Facing +Z (South, if +Z is South for your map coordinates)
+                puzzleDoorMesh.rotation.y = 0; // Assuming default door model faces +Z
+            } else { // Facing -Z (North)
+                puzzleDoorMesh.rotation.y = Math.PI;
+            }
+        } else {
+            // Fallback or error if normal is not axis-aligned (should ideally not happen with grid-based walls)
+            console.warn("Puzzle door facingNormal is not axis-aligned:", facingNormal, "Defaulting rotation to 0.");
+            puzzleDoorMesh.rotation.y = 0;
+        }
+    } else {
+        console.error("createPuzzleDoor called without a valid facingNormal! Defaulting rotation to 0.");
+        puzzleDoorMesh.rotation.y = 0; // Default orientation
     }
-    // Default is 'horizontal', facing along X, no rotation needed initially for sub-components
+    // --- END NEW ORIENTATION LOGIC ---
 
     scene.add(puzzleDoorMesh);
+    // Important: Add targets to echoableObjects AFTER they are parented to puzzleDoorMesh and puzzleDoorMesh is positioned and oriented,
+    // so their world matrices and AABBs are correct if calculated immediately.
     echoableObjects.push(puzzleDoorMesh, puzzleDoorTarget1Mesh, puzzleDoorTarget2Mesh); 
 
+    // Update AABBs for targets in world space *after* parent transformations are applied.
+    // This is crucial if AABBs are calculated once and stored.
+    puzzleDoorMesh.updateMatrixWorld(true); // Ensure world matrix is up-to-date
+    puzzleDoorTarget1Mesh.userData.aabb.setFromObject(puzzleDoorTarget1Mesh); // This will now be in world space if object is added to scene
+    puzzleDoorTarget2Mesh.userData.aabb.setFromObject(puzzleDoorTarget2Mesh); // Or use .applyMatrix4(puzzleDoorTarget1Mesh.matrixWorld) if not yet in scene hierarchy properly.
+                                                                         // Simpler to ensure matrixWorld is updated before this. Box3.setFromObject uses world matrix.
+
     // Set AABB for the main door for player collision (to pass through when open)
-    // This AABB should encompass the entire door structure including frame for echo purposes.
-    // For player pass-through logic, we might use a simpler trigger volume or disable collision.
     puzzleDoorMesh.userData.aabb = new THREE.Box3().setFromObject(puzzleDoorMesh);
 
     isPuzzleDoorActive = true;
@@ -2244,12 +2443,26 @@ function createPuzzleDoor(position, orientation) {
     isPuzzleDoorTarget2Hit = false;
     isPuzzleDoorOpen = false;
 
-    console.log("Puzzle door created at:", position, "Orientation:", orientation);
+    console.log("Puzzle door created at:", position, "Facing normal:", facingNormal, "Actual rotation.y:", puzzleDoorMesh.rotation.y);
 }
 
 // NEW: Function to load a new maze
 function loadNewMaze() {
     console.log("Loading new maze...");
+
+    // Play maze reset sound
+    if (mazeResetSoundBuffer && audioContext) {
+        if (audioContext.state === 'suspended') {
+            audioContext.resume().catch(e => console.error("Error resuming AudioContext for maze reset sound:", e));
+        }
+        const source = audioContext.createBufferSource();
+        source.buffer = mazeResetSoundBuffer;
+        source.connect(audioContext.destination);
+        source.start(0);
+        console.log("Playing midradar.mp3 for maze reset.");
+    } else {
+        console.warn("mazeResetSoundBuffer not loaded or audioContext not available for midradar.mp3");
+    }
 
     // 1. Stop sounds (optional, depends on what should carry over)
     // stopBeatSound(); // Already handled if power-up expires, but good for explicit reset
@@ -2279,7 +2492,7 @@ function loadNewMaze() {
         const target1Idx = echoableObjects.indexOf(puzzleDoorTarget1Mesh);
         if (target1Idx > -1) echoableObjects.splice(target1Idx, 1);
         const target2Idx = echoableObjects.indexOf(puzzleDoorTarget2Mesh);
-        if (target2Idx > -1) echoableObjects.splice(target2Idx, 1);
+        if (target2Idx > -1) echoableObjects.splice(target2Index, 1);
 
         puzzleDoorMesh = null;
         puzzleDoorTarget1Mesh = null;
@@ -2968,8 +3181,8 @@ function onSqueezeEnd(event) {
 }
 
 // Handle VR movement
-function handleVRMovement(deltaTime) {
-    if (!isInVR) return;
+function handleVRMovement(deltaTime, xrFrame) { // Added xrFrame parameter
+    if (!isInVR || !xrFrame) return; // Check for xrFrame too
     
     try {
         // Get the XR session
@@ -2999,84 +3212,73 @@ function handleVRMovement(deltaTime) {
             axisX = gamepad.axes[2]; 
             axisY = gamepad.axes[3];
             
-            // Only continue if there's significant input
-            if (Math.abs(axisX) < 0.2 && Math.abs(axisY) < 0.2) {
-                return;
+            // Only process movement if there's significant input
+            if (Math.abs(axisX) >= 0.2 || Math.abs(axisY) >= 0.2) { // Changed from && to ||, and removed early return
+                // axisY = -axisY; // This line is removed to not invert the Y axis
+                
+                // Debug on significant input
+                console.log(`Left stick input: X=${axisX.toFixed(2)}, Y=${axisY.toFixed(2)}`);
+                
+                // Try moving with reference space first (more reliable method on Quest)
+                // const movedWithReferenceSpace = movePlayerWithReferenceSpace(axisX, axisY, deltaTime); // Original line if needed for fallback
+                movePlayerWithReferenceSpace(axisX, axisY, deltaTime); // Directly call, assume it works or handles its own errors
+                
+                // Fallback to camera rig movement is removed for now, assuming reference space works.
             }
-            
-            // Don't invert Y axis as requested by user
-            // axisY = -axisY; // This line is removed to not invert the Y axis
-            
-            // Debug on significant input
-            console.log(`Left stick input: X=${axisX.toFixed(2)}, Y=${axisY.toFixed(2)}`);
-            
-            // Try moving with reference space first (more reliable method on Quest)
-            const movedWithReferenceSpace = movePlayerWithReferenceSpace(axisX, axisY, deltaTime);
-            
-            // If reference space movement failed, fall back to camera rig movement
-            if (!movedWithReferenceSpace) {
-                // Get the camera and rig
-                const xrCamera = renderer.xr.getCamera();
-                if (!xrCamera) {
-                    return;
-                }
-                
-                const cameraRig = xrCamera.parent;
-                if (!cameraRig) {
-                    console.log("No camera rig found!");
-                    return;
-                }
-                
-                // Get movement direction based on headset orientation
-                const headsetDirection = new THREE.Vector3(0, 0, -1); // Forward
-                headsetDirection.applyQuaternion(xrCamera.quaternion);
-                headsetDirection.y = 0; // Keep movement horizontal
-                headsetDirection.normalize();
-                
-                const rightDirection = new THREE.Vector3(1, 0, 0); // Right
-                rightDirection.applyQuaternion(xrCamera.quaternion);
-                rightDirection.y = 0;
-                rightDirection.normalize();
-                
-                // Calculate movement vector
-                const movement = new THREE.Vector3();
-                
-                // Apply forward/backward movement (using Y axis)
-                if (Math.abs(axisY) > 0.2) {
-                    const forwardMagnitude = axisY * VR_MOVE_SPEED * deltaTime * 1.5; // Reduced speed multiplier
-                    movement.addScaledVector(headsetDirection, forwardMagnitude);
-                }
-                
-                // Apply left/right movement (using X axis)
-                if (Math.abs(axisX) > 0.2) {
-                    const rightMagnitude = -axisX * VR_MOVE_SPEED * deltaTime * 1.5; // Negative sign to invert X axis
-                    movement.addScaledVector(rightDirection, rightMagnitude);
-                }
-                
-                // If we have movement to apply
-                if (movement.lengthSq() > 0) {
-                    // Apply movement to the camera rig
-                    cameraRig.position.add(movement);
-                    console.log("Camera rig movement:", movement.x.toFixed(2), movement.z.toFixed(2));
-                    
-                    // Create a red marker at current position for debugging
-                    if (Math.abs(axisX) > 0.7 || Math.abs(axisY) > 0.7) {
-                        const marker = new THREE.Mesh(
-                            new THREE.SphereGeometry(0.05),
-                            new THREE.MeshBasicMaterial({color: 0xff0000})
-                        );
-                        marker.position.copy(cameraRig.position);
-                        marker.position.y = 0; // Place on the ground
-                        scene.add(marker);
-                        
-                        // Remove marker after 2 seconds
-                        setTimeout(() => {
-                            scene.remove(marker);
-                        }, 2000);
+            // REMOVED: else block that would previously return if input was too low.
+            // Now, even if left stick input is low, we proceed to right stick logic.
+        }
+
+        // --- Right Thumbstick Smooth Turning ---
+        const rightController = inputSources.find(source =>
+            source.handedness === 'right' && source.gamepad);
+
+        if (rightController && rightController.gamepad) {
+            const turnAxisX = vrControllerInputs.right.thumbstickX; // Use the polled value
+
+            // Check if stick is deflected beyond the deadzone
+            if (Math.abs(turnAxisX) >= VR_SMOOTH_TURN_DEADZONE) {
+                const rotationAmount = turnAxisX * VR_SMOOTH_TURN_SPEED * deltaTime; // Direction already swapped
+                const currentReferenceSpace = renderer.xr.getReferenceSpace(); // Renamed for clarity
+
+                if (currentReferenceSpace && xrFrame) { // Ensure xrFrame is available
+                    const viewerPose = xrFrame.getViewerPose(currentReferenceSpace);
+                    if (!viewerPose) {
+                        console.warn("Smooth Turn: Cannot get viewer pose.");
+                        return;
                     }
+
+                    // P_cam_rs is the viewer's position in the current reference space
+                    const P_cam_rs = new THREE.Vector3(
+                        viewerPose.transform.position.x,
+                        viewerPose.transform.position.y,
+                        viewerPose.transform.position.z
+                    );
+
+                    const q_turn = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), rotationAmount);
+
+                    // Calculate T_offset's position component: P_cam_rs - (q_turn * P_cam_rs)
+                    // This is the position part of an XRRigidTransform that rotates around P_cam_rs.
+                    const P_cam_rs_rotated_by_q_turn = P_cam_rs.clone().applyQuaternion(q_turn);
+                    const T_offset_position_vec = P_cam_rs.clone().sub(P_cam_rs_rotated_by_q_turn);
+                    
+                    const transform_offset = new XRRigidTransform(
+                        { x: T_offset_position_vec.x, y: T_offset_position_vec.y, z: T_offset_position_vec.z }, 
+                        { x: q_turn.x, y: q_turn.y, z: q_turn.z, w: q_turn.w }
+                    );
+                    
+                    const newReferenceSpace = currentReferenceSpace.getOffsetReferenceSpace(transform_offset);
+                    renderer.xr.setReferenceSpace(newReferenceSpace);
+                } else {
+                    if (!currentReferenceSpace) console.warn("Smooth Turn: Cannot turn: XR referenceSpace not available.");
+                    if (!xrFrame) console.warn("Smooth Turn: Cannot turn: XRFrame not available for viewer pose.");
                 }
+            } else {
+                // Stick is within the deadzone, no turning.
             }
         }
+        // --- End Right Thumbstick Smooth Turning ---
+
     } catch (error) {
         console.error("Error in handleVRMovement:", error);
     }
@@ -3484,4 +3686,8 @@ function updateVRMiniMap() {
     // Update the texture
     vrMiniMapTexture.needsUpdate = true;
 }
+
+
+
+
 

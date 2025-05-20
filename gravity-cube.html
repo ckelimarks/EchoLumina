@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gravity Shifting Cube</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; color: white; font-family: Arial, sans-serif; }
+        canvas { display: block; }
+        #gravity-info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            padding: 10px;
+            background-color: rgba(0,0,0,0.5);
+            border-radius: 5px;
+            font-size: 16px;
+        }
+        #reticle {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 10px;
+            height: 10px;
+            background-color: white;
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            display: none; /* Hidden by default, shown on pointer lock */
+        }
+    </style>
+</head>
+<body>
+    <div id="gravity-info">Gravity: Initializing...</div>
+    <div id="reticle"></div>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.165.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.165.0/examples/jsm/"
+            }
+        }
+    </script>
+    <script type="module">
+        import * as THREE from 'three';
+        import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+        import { VRButton } from 'three/addons/webxr/VRButton.js';
+
+        let scene, camera, renderer, controls;
+        let playerMesh; // A simple mesh representing the player for collision and orientation
+        
+        const CUBE_SIZE = 20;
+        const WALL_THICKNESS = 0.2;
+        const PLAYER_HEIGHT = 1.6;
+        const PLAYER_RADIUS = 0.1;
+
+        let cubeFaces = []; // To store for collision and gravity checks
+        let gravityInfoDiv;
+
+        // Gravity and Animation State
+        let currentGravityNormal = new THREE.Vector3(0, -1, 0); // Start with standard gravity
+        let targetGravityNormal = new THREE.Vector3(0, -1, 0);
+        let isGravityShifting = false;
+        let gravityAnimationStartTime = 0;
+        const GRAVITY_ANIMATION_DURATION = 1.0; // seconds
+        let gravityAnimationStartQuaternion = new THREE.Quaternion();
+        let gravityAnimationTargetQuaternion = new THREE.Quaternion();
+        let gravityAnimationStartPlayerPosition = new THREE.Vector3(); // For potential position animation
+        let gravityAnimationTargetPlayerPosition = new THREE.Vector3(); // For potential position animation
+
+        let lastGravityShiftTriggerTime = -Infinity; // Initialize to allow the first shift
+        const GRAVITY_SHIFT_COOLDOWN = 0.5; // seconds
+
+        let playerVelocity = new THREE.Vector3();
+        const PLAYER_SPEED = 5.0;
+        const GRAVITY_FORCE = 9.8 * 2; // A bit stronger for snappier feel
+        let onGround = false;
+
+        const keyboardState = {};
+
+        // Player's local "up" vector, inverse of gravity normal
+        let playerUp = new THREE.Vector3(0, 1, 0); 
+
+        const clock = new THREE.Clock();
+
+        // VR Controller references
+        let leftVRController;
+        let rightVRController; // Though only left is used for movement for now
+
+        // Maze constants
+        const MAZE_GRID_SIZE = 10; // e.g., 10x10 cells per face
+        const MAZE_CELL_SIZE = CUBE_SIZE / MAZE_GRID_SIZE;
+        const MAZE_WALL_HEIGHT = PLAYER_HEIGHT * 1.5;
+        const MAZE_WALL_THICKNESS = WALL_THICKNESS * 2; // Make maze walls a bit thicker
+
+        let mazesData = []; // To store 2D grid and other info for each face
+
+        // Helper functions for logging vectors
+        function vec3ToString(v) {
+            if (!v) return "null";
+            return `(${v.x.toFixed(2)}, ${v.y.toFixed(2)}, ${v.z.toFixed(2)})`;
+        }
+        function playerPosToString(p) {
+            if (!p) return "null";
+            return `X:${p.x.toFixed(2)} Y:${p.y.toFixed(2)} Z:${p.z.toFixed(2)}`;
+        }
+
+        init();
+        animate();
+
+        function init() {
+            console.log("init");
+            gravityInfoDiv = document.getElementById('gravity-info');
+            const reticle = document.getElementById('reticle');
+
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 100);
+            
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+            document.body.appendChild(VRButton.createButton(renderer));
+
+            // Lighting
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambientLight);
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+            directionalLight.position.set(5, 10, 7.5);
+            scene.add(directionalLight);
+
+            // Player representation (invisible, used for physics and orientation)
+            playerMesh = new THREE.Object3D(); // This is the "body"
+            scene.add(playerMesh);
+            
+            // Camera setup
+            playerMesh.add(camera); // Camera is child of playerMesh
+            camera.position.set(0, PLAYER_HEIGHT * 0.85, 0); // Eye height within playerMesh (origin of playerMesh is at its feet)
+
+            // Player collision helper
+            const playerCollisionHelperGeo = new THREE.CylinderGeometry(PLAYER_RADIUS, PLAYER_RADIUS, PLAYER_HEIGHT, 16);
+            const playerCollisionHelperMat = new THREE.MeshBasicMaterial({ color: 0xff0000, wireframe: true, transparent: true, opacity: 0.3 });
+            const playerCollisionHelper = new THREE.Mesh(playerCollisionHelperGeo, playerCollisionHelperMat);
+            // CylinderGeometry origin is at its center, playerMesh origin is at feet.
+            playerCollisionHelper.position.set(0, PLAYER_HEIGHT / 2, 0); 
+            playerMesh.add(playerCollisionHelper);
+
+
+            // Initial Player Position & Orientation
+            const initialFloorY = CUBE_SIZE / 2 - WALL_THICKNESS / 2; // Inner surface of top face
+            playerMesh.position.set(0, initialFloorY, 0); // Player feet on the initial floor
+            playerUp.set(0,1,0); // Player's local up is world up initially
+            playerMesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), playerUp);
+
+
+            updateGravityInfo();
+            setupVRControllers(); // Initialize VR controllers
+            initMazes(); // Generate and build the 3D maze
+
+            // Controls - PointerLockControls now controls the camera directly for orientation
+            controls = new PointerLockControls(camera, renderer.domElement);
+            // We will manually apply yaw to playerMesh and use camera for pitch.
+            
+            const gameCanvas = renderer.domElement;
+            gameCanvas.addEventListener('click', () => {
+                if (!controls.isLocked && !renderer.xr.isPresenting) {
+                    controls.lock();
+                }
+            });
+
+            controls.addEventListener('lock', () => reticle.style.display = 'block');
+            controls.addEventListener('unlock', () => reticle.style.display = 'none');
+
+            document.addEventListener('keydown', (event) => keyboardState[event.code] = true);
+            document.addEventListener('keyup', (event) => keyboardState[event.code] = false);
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        function createFace(size, thickness, color, position, normal) {
+            const geometry = new THREE.BoxGeometry(size, size, thickness);
+            const material = new THREE.MeshStandardMaterial({ color: color, side: THREE.DoubleSide });
+            const face = new THREE.Mesh(geometry, material);
+            
+            face.position.copy(position);
+            
+            // Align face normal
+            const defaultNormal = new THREE.Vector3(0,0,1); // Default normal for BoxGeometry aligned with Z
+            face.quaternion.setFromUnitVectors(defaultNormal, normal.clone().normalize());
+
+            scene.add(face);
+            
+            // Store face data for collision and gravity checks
+            // AABB for collision, using world coordinates
+            const faceBox = new THREE.Box3().setFromObject(face);
+            cubeFaces.push({ 
+                mesh: face, 
+                normal: normal.clone().normalize(), // Outward normal of the cube face
+                aabb: faceBox,
+                name: getFaceName(normal)
+            });
+            return face;
+        }
+        
+        function getFaceName(normal) {
+            if (normal.equals(new THREE.Vector3(0, 1, 0))) return "Top (+Y)";
+            if (normal.equals(new THREE.Vector3(0, -1, 0))) return "Bottom (-Y)";
+            if (normal.equals(new THREE.Vector3(1, 0, 0))) return "Right (+X)";
+            if (normal.equals(new THREE.Vector3(-1, 0, 0))) return "Left (-X)";
+            if (normal.equals(new THREE.Vector3(0, 0, 1))) return "Front (+Z)";
+            if (normal.equals(new THREE.Vector3(0, 0, -1))) return "Back (-Z)";
+            return "Unknown";
+        }
+
+        function updateGravityInfo() {
+            const gravityDirectionName = getFaceName(currentGravityNormal.clone().negate()); // Show where player is "falling towards"
+            gravityInfoDiv.textContent = `Gravity Towards: ${gravityDirectionName}`;
+        }
+
+        function onWindowResize() {
+            if (renderer.xr.isPresenting) return; // Don't resize if in VR
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+
+        function render() {
+            const deltaTime = clock.getDelta();
+
+            if (renderer.xr.isPresenting) {
+                handleVRInput(deltaTime);
+            } else {
+                handleInput(deltaTime);
+            }
+            applyGravityAndCollisions(deltaTime);
+            
+            if (isGravityShifting) {
+                const elapsedTime = clock.getElapsedTime() - gravityAnimationStartTime;
+                let t = Math.min(elapsedTime / GRAVITY_ANIMATION_DURATION, 1.0);
+                t = t * t * (3 - 2 * t); // Smoothstep easing
+
+                // Slerp player's orientation
+                playerMesh.quaternion.slerpQuaternions(gravityAnimationStartQuaternion, gravityAnimationTargetQuaternion, t);
+                
+                // Placeholder for positional LERP - currently target is same as start
+                // playerMesh.position.lerpVectors(gravityAnimationStartPlayerPosition, gravityAnimationTargetPlayerPosition, t);
+
+                if (t >= 1.0) {
+                    isGravityShifting = false;
+                    currentGravityNormal.copy(targetGravityNormal);
+                    playerUp.copy(currentGravityNormal.clone().negate().normalize()); // Update player's local up
+                    playerMesh.quaternion.copy(gravityAnimationTargetQuaternion); // Final snap to target orientation
+                    // playerMesh.position.copy(gravityAnimationTargetPlayerPosition); // Snap to animated target position (if it were different)
+                    updateGravityInfo();
+                    stickToSurface(); // Ensure player is on the new surface and correctly positioned/clamped
+                }
+            }
+
+            renderer.render(scene, camera); // Pass the camera variable directly
+        }
+
+        function handleInput(deltaTime) {
+            // For non-VR, PointerLockControls handles camera directly.
+            // We need to transfer yaw to playerMesh and use camera for pitch.
+            // Keyboard movement will be relative to playerMesh's orientation.
+
+            if (!renderer.xr.isPresenting && controls.isLocked) {
+                // Get camera's current quaternion (which PLC has updated based on mouse)
+                const cameraWorldQuaternion = camera.getWorldQuaternion(new THREE.Quaternion());
+
+                // Extract yaw component for playerMesh
+                // Decompose camera's world quaternion to get yaw around player's current 'up' axis
+                const _tmpEuler = new THREE.Euler().setFromQuaternion(cameraWorldQuaternion, 'YXZ');
+                
+                // We want playerMesh's 'up' to align with `playerUp`
+                // And its 'forward' to align with camera's projected forward on player's horizontal plane.
+                const cameraForward = new THREE.Vector3(0,0,-1).applyQuaternion(cameraWorldQuaternion);
+                const targetPlayerForward = cameraForward.clone().projectOnPlane(playerUp).normalize();
+
+                if (targetPlayerForward.lengthSq() > 0.001) {
+                    const targetLookAtMatrix = new THREE.Matrix4().lookAt(
+                        playerMesh.position, // look from player's current position
+                        playerMesh.position.clone().add(targetPlayerForward), // look towards target forward
+                        playerUp // player's current up vector
+                    );
+                    playerMesh.quaternion.setFromRotationMatrix(targetLookAtMatrix);
+                }
+                // The camera's pitch is already handled by PointerLockControls modifying camera.quaternion directly.
+                // We don't need to clamp pitch here as PLC does it internally.
+            }
+
+
+            const speed = PLAYER_SPEED * deltaTime;
+            const moveDirection = new THREE.Vector3();
+
+            if (keyboardState['KeyW']) moveDirection.z -= 1;
+            if (keyboardState['KeyS']) moveDirection.z += 1;
+            if (keyboardState['KeyA']) moveDirection.x -= 1;
+            if (keyboardState['KeyD']) moveDirection.x += 1;
+
+            if (moveDirection.lengthSq() > 0) {
+                moveDirection.normalize();
+                // Apply movement relative to playerMesh's orientation
+                playerMesh.translateX(moveDirection.x * speed);
+                playerMesh.translateZ(moveDirection.z * speed);
+            }
+        }
+        
+        function setupVRControllers() {
+            // Controller 1 (typically left hand for movement)
+            leftVRController = renderer.xr.getController(0);
+            leftVRController.addEventListener('connected', function (event) {
+                console.log("Left VR Controller connected");
+                this.gamepad = event.data.gamepad; // 'this' refers to leftVRController
+            });
+            leftVRController.addEventListener('disconnected', function () {
+                console.log("Left VR Controller disconnected");
+                this.gamepad = null;
+            });
+            playerMesh.add(leftVRController); // Add to player rig if we need its position/orientation relative to player
+
+            // Controller 2 (typically right hand)
+            rightVRController = renderer.xr.getController(1);
+            rightVRController.addEventListener('connected', function (event) {
+                console.log("Right VR Controller connected");
+                this.gamepad = event.data.gamepad;
+            });
+            rightVRController.addEventListener('disconnected', function () {
+                console.log("Right VR Controller disconnected");
+                this.gamepad = null;
+            });
+            playerMesh.add(rightVRController);
+        }
+
+        function handleVRInput(deltaTime) {
+            if (!renderer.xr.isPresenting) return;
+
+            const session = renderer.xr.getSession();
+            if (!session) return;
+
+            const desiredInputVelocity = new THREE.Vector3();
+            let moveX = 0;
+            let moveZ = 0;
+
+            let leftGamepad = null;
+            for (const source of session.inputSources) {
+                if (source.handedness === 'left' && source.gamepad) {
+                    leftGamepad = source.gamepad;
+                    break;
+                }
+            }
+            
+            if (!leftGamepad && leftVRController && leftVRController.gamepad) {
+                leftGamepad = leftVRController.gamepad;
+            }
+
+            if (leftGamepad) {
+                if (leftGamepad.axes.length > 3) {
+                    const thumbstickX = leftGamepad.axes[2];
+                    const thumbstickY = leftGamepad.axes[3];
+
+                    if (Math.abs(thumbstickX) > 0.1) {
+                        moveX = -thumbstickX;
+                    }
+                    if (Math.abs(thumbstickY) > 0.1) {
+                        moveZ = -thumbstickY;
+                    }
+                }
+            }
+            
+            if (Math.abs(moveX) > 0 || Math.abs(moveZ) > 0) {
+                const moveVector = new THREE.Vector3(moveX, 0, moveZ).normalize();
+                
+                const cameraDirection = new THREE.Vector3();
+                camera.getWorldDirection(cameraDirection);
+                
+                const rightDirection = new THREE.Vector3().crossVectors(playerUp, cameraDirection).normalize();
+                const forwardOnPlane = cameraDirection.clone().projectOnPlane(playerUp).normalize();
+                
+                if (forwardOnPlane.lengthSq() === 0) {
+                    playerMesh.getWorldDirection(forwardOnPlane);
+                    forwardOnPlane.projectOnPlane(playerUp).normalize();
+                }
+                
+                desiredInputVelocity.addScaledVector(forwardOnPlane, moveVector.z * PLAYER_SPEED);
+                desiredInputVelocity.addScaledVector(rightDirection, moveVector.x * PLAYER_SPEED);
+
+                if (onGround) {
+                    const currentVerticalVelocity = playerVelocity.clone().projectOnVector(playerUp);
+                    playerVelocity.copy(currentVerticalVelocity); 
+                    playerVelocity.add(desiredInputVelocity); 
+                } else {
+                    // Add a scaled version for air control, to prevent excessive speed buildup
+                    playerVelocity.addScaledVector(desiredInputVelocity, 0.1); // Make air control less impactful than ground
+                }
+            } else {
+                if (onGround) {
+                    const currentVerticalVelocity = playerVelocity.clone().projectOnVector(playerUp);
+                    const horizontalVelocity = playerVelocity.clone().projectOnPlane(playerUp);
+                    horizontalVelocity.multiplyScalar(0.90); // Damping factor, adjust for feel (e.g., 0.9 for moderate, 0.0 for immediate stop)
+                    playerVelocity.copy(currentVerticalVelocity).add(horizontalVelocity);
+                }
+            }
+            // Ensure playerVelocity does not exceed a maximum speed, especially horizontally
+            const maxHorizontalSpeed = PLAYER_SPEED; 
+            const horizontalVel = playerVelocity.clone().projectOnPlane(playerUp);
+            if (horizontalVel.lengthSq() > maxHorizontalSpeed * maxHorizontalSpeed) {
+                horizontalVel.normalize().multiplyScalar(maxHorizontalSpeed);
+                playerVelocity.copy(horizontalVel.add(playerVelocity.clone().projectOnVector(playerUp)));
+            }
+
+            // console.log("Player position:", playerMesh.position); // Removed direct position update
+            // console.log("left");
+        }
+
+        function stickToSurface() {
+            // Raycast directly "down" from player's perspective to find the current floor
+            const localDown = new THREE.Vector3(0, -1, 0); // Player's local down
+            const worldDown = localDown.clone().applyQuaternion(playerMesh.quaternion); // Transform to world space
+
+            const raycaster = new THREE.Raycaster(playerMesh.position, worldDown, 0, PLAYER_HEIGHT * 2);
+            const floorMeshes = cubeFaces.map(f => f.mesh);
+            const intersects = raycaster.intersectObjects(floorMeshes);
+
+            if (intersects.length > 0) {
+                const distanceToFloor = intersects[0].distance;
+                const newFloorNormal = intersects[0].face.normal.clone().applyQuaternion(intersects[0].object.quaternion).normalize();
+                playerMesh.position.copy(intersects[0].point).addScaledVector(newFloorNormal, PLAYER_HEIGHT * 0.5 + 0.01); // 0.01 epsilon
+                onGround = true;
+                playerVelocity.set(0,0,0); // Stop residual velocity from fall
+            } else {
+                 const closestFace = findClosestFaceAlongGravity();
+                 if (closestFace) {
+                    // dist is distance from player center to the plane of the inner surface of closestFace
+                    const playerCenterToInnerSurfacePlane = playerMesh.position.dot(closestFace.normal) - (closestFace.mesh.position.dot(closestFace.normal) - WALL_THICKNESS / 2 * Math.sign(closestFace.normal.dot(playerUp)));
+                    playerMesh.position.addScaledVector(closestFace.normal, -playerCenterToInnerSurfacePlane + PLAYER_HEIGHT * 0.5 + 0.01);
+                    onGround = true;
+                    playerVelocity.set(0,0,0);
+                 }
+            }
+
+            // After player position is set, clamp lateral coordinates to prevent immediate re-shift
+            // const actualEdgeValForStick = CUBE_SIZE / 2 - WALL_THICKNESS / 2;
+            // const clampingBufferStick = PLAYER_RADIUS * 1.2; // Must be > PLAYER_RADIUS * 1.1 used in trigger
+            // const clampingLimitStick = actualEdgeValForStick - clampingBufferStick;
+
+            // if (clampingLimitStick > 0) { // Proceed only if clamping limit is sensible
+            //     const pos = playerMesh.position;
+            //     const upDir = playerUp.clone(); // playerUp is the player's local "up" vector in world space
+
+            //     if (Math.abs(upDir.y) > 0.9) { // Player is on Top or Bottom face (gravity along Y)
+            //         pos.x = Math.max(-clampingLimitStick, Math.min(clampingLimitStick, pos.x));
+            //         pos.z = Math.max(-clampingLimitStick, Math.min(clampingLimitStick, pos.z));
+            //     } else if (Math.abs(upDir.x) > 0.9) { // Player is on Left or Right face (gravity along X)
+            //         pos.y = Math.max(-clampingLimitStick, Math.min(clampingLimitStick, pos.y));
+            //         pos.z = Math.max(-clampingLimitStick, Math.min(clampingLimitStick, pos.z));
+            //     } else if (Math.abs(upDir.z) > 0.9) { // Player is on Front or Back face (gravity along Z)
+            //         pos.x = Math.max(-clampingLimitStick, Math.min(clampingLimitStick, pos.x));
+            //         pos.y = Math.max(-clampingLimitStick, Math.min(clampingLimitStick, pos.y));
+            //     }
+            //     playerMesh.position.copy(pos);
+            // } else {
+            //     console.warn("Clamping limit in stickToSurface is not positive, skipping clamping.");
+            // }
+        }
+
+        function findClosestFaceAlongGravity() {
+            let closestFace = null;
+            let minDistance = Infinity;
+
+            for (const faceData of cubeFaces) {
+                // Project player's position onto the face's OUTWARD normal
+                // Distance from player to plane of the face's *inner* surface
+                // The face normal points outwards. The gravity normal is opposite to the "floor" face's normal.
+                // So, if currentGravityNormal is (0,-1,0), the floor is the +Y face whose normal is (0,1,0).
+                if (faceData.normal.dot(currentGravityNormal.clone().negate()) > 0.99) { // Is this the current "floor" face?
+                    // Distance from player's feet to the face's inner surface
+                    // Player's feet are at playerMesh.position - playerUp * PLAYER_HEIGHT/2
+                    const playerFeet = playerMesh.position.clone().addScaledVector(playerUp, -PLAYER_HEIGHT * 0.5);
+                    const distToPlane = (playerFeet.dot(faceData.normal) - faceData.mesh.position.dot(faceData.normal) + WALL_THICKNESS / 2);
+                    
+                    if (distToPlane < minDistance) {
+                        minDistance = distToPlane;
+                        closestFace = faceData;
+                    }
+                }
+            }
+            return closestFace;
+        }
+
+
+        function applyGravityAndCollisions(deltaTime) {
+            if (isGravityShifting) {
+                playerVelocity.set(0, 0, 0); // Stop player during gravity shift
+                return;
+            }
+
+            // Apply gravity to playerVelocity (always apply, floor collision will counteract if on ground)
+            const localDownWorld = new THREE.Vector3(0, -1, 0).applyQuaternion(playerMesh.quaternion);
+            // Only apply gravity if not on ground, or if on ground but moving upwards (e.g. jump peak)
+            // If onGround is true, floor collision should stop downward velocity.
+            if (!onGround) { // Apply gravity if in the air
+                 playerVelocity.addScaledVector(localDownWorld, GRAVITY_FORCE * deltaTime);
+            }
+            
+            // *** Apply displacement based on playerVelocity ***
+            playerMesh.position.add(playerVelocity.clone().multiplyScalar(deltaTime));
+
+
+            // --- Floor Collision Detection and Response (Adjusted) ---
+            let activeMazeFaceData = null;
+            for (const data of mazesData) {
+                // currentGravityNormal is "down", data.normal is outward face normal.
+                // If data.normal is opposite of currentGravityNormal, that's our current supporting face.
+                if (data.normal.dot(currentGravityNormal.clone().negate()) > 0.99) { 
+                    activeMazeFaceData = data;
+                    break;
+                }
+            }
+
+            if (activeMazeFaceData && activeMazeFaceData.floorMesh) {
+                const playerFeetWorld = playerMesh.position.clone(); // playerMesh.position is at feet level
+                
+                const floorPlaneNormal = activeMazeFaceData.normal.clone().negate().normalize(); 
+                const pointOnPlane = new THREE.Vector3().copy(activeMazeFaceData.normal).multiplyScalar(CUBE_SIZE/2 - WALL_THICKNESS/2);
+                const floorSurfaceD = floorPlaneNormal.dot(pointOnPlane);
+
+                const distPlayerFeetToPlane = playerFeetWorld.dot(floorPlaneNormal) - floorSurfaceD;
+
+                const floorTolerance = 0.1; // Increased tolerance
+                const floorCorrectionFactor = 0.01; // Small epsilon
+
+                if (distPlayerFeetToPlane < floorTolerance) { 
+                    const correctionAmount = -distPlayerFeetToPlane + floorCorrectionFactor;
+                    playerMesh.position.addScaledVector(floorPlaneNormal, correctionAmount);
+                    onGround = true;
+                    const velDotNormal = playerVelocity.dot(floorPlaneNormal);
+                    if (velDotNormal < 0) { 
+                        playerVelocity.addScaledVector(floorPlaneNormal, -velDotNormal * 0.8);
+                    }
+                } else {
+                    onGround = false;
+                }
+            } else {
+                onGround = false; 
+                // console.warn("No active maze floor found for current gravity:", vec3ToString(currentGravityNormal));
+            }
+
+            // --- Wall Collision Detection and Response ---
+            const playerCylinderCenter = playerMesh.position.clone().addScaledVector(playerUp, PLAYER_HEIGHT * 0.5);
+            const tmpVec = new THREE.Vector3(); // For temporary calculations
+
+            const allMeshesToCollide = [];
+            // Add outer cube shell faces
+            cubeFaces.forEach(cf => allMeshesToCollide.push(cf.mesh));
+            // Add all maze walls from all faces
+            mazesData.forEach(md => {
+                if (md.mazeWalls) { 
+                    md.mazeWalls.children.forEach(wall => allMeshesToCollide.push(wall));
+                }
+            });
+
+            for (const wallMesh of allMeshesToCollide) {
+                const wallWorldPos = wallMesh.getWorldPosition(tmpVec.clone());
+
+                // Optimize: skip walls far away from player
+                const maxWallDimension = Math.max(MAZE_CELL_SIZE, MAZE_WALL_HEIGHT, MAZE_WALL_THICKNESS, CUBE_SIZE);
+                if (playerCylinderCenter.distanceToSquared(wallWorldPos) > Math.pow(maxWallDimension + PLAYER_RADIUS * 2, 2)) {
+                    continue;
+                }
+
+                const wallWorldQuaternion = wallMesh.getWorldQuaternion(new THREE.Quaternion());
+                const geoParams = wallMesh.geometry.parameters;
+
+                let localThicknessNormal = new THREE.Vector3(); 
+                let wallThickness = 0;
+
+                if (wallMesh.geometry.type === "BoxGeometry") {
+                    if (geoParams.width !== undefined && Math.abs(geoParams.width - MAZE_WALL_THICKNESS) < 0.001) {
+                        localThicknessNormal.set(1, 0, 0); 
+                        wallThickness = MAZE_WALL_THICKNESS;
+                    } else if (geoParams.depth !== undefined && Math.abs(geoParams.depth - MAZE_WALL_THICKNESS) < 0.001) {
+                        localThicknessNormal.set(0, 0, 1); 
+                        wallThickness = MAZE_WALL_THICKNESS;
+                    } else if (geoParams.height !== undefined && Math.abs(geoParams.height - MAZE_WALL_THICKNESS) < 0.001) { 
+                        // This case might be for North/South walls if their "height" param refers to thickness
+                        // For BoxGeometry(width, height, depth), height is Y. So if thickness is along Y.
+                        localThicknessNormal.set(0, 1, 0);
+                        wallThickness = MAZE_WALL_THICKNESS;
+                    } else if (wallMesh.parent && wallMesh.parent.parent === scene && geoParams.depth !== undefined && Math.abs(geoParams.depth - WALL_THICKNESS) < 0.001) {
+                        // Outer cube faces (children of scene, not faceGroup which is child of scene)
+                        // Their defining geometry has depth as WALL_THICKNESS (e.g. BoxGeometry(size, size, thickness))
+                        // and their face normal is local Z.
+                        localThicknessNormal.set(0, 0, 1); 
+                        wallThickness = WALL_THICKNESS;
+                    }
+                }
+                
+                if (wallThickness === 0) { 
+                    // console.warn("Skipping wall due to zero thickness or unknown type:", wallMesh, geoParams);
+                    continue;
+                }
+
+                const wallOutwardNormal = localThicknessNormal.clone().applyQuaternion(wallWorldQuaternion).normalize();
+                const wallToPlayer = playerCylinderCenter.clone().sub(wallWorldPos);
+
+                let collisionNormalForPush = wallOutwardNormal.clone();
+                if (wallToPlayer.dot(wallOutwardNormal) < 0) { 
+                    collisionNormalForPush.negate(); 
+                }
+
+                const pointOnInnerSurface = wallWorldPos.clone().addScaledVector(collisionNormalForPush, wallThickness / 2);
+                const distFromPlayerCenterToInnerSurface = playerCylinderCenter.clone().sub(pointOnInnerSurface).dot(collisionNormalForPush);
+                const penetration = PLAYER_RADIUS - distFromPlayerCenterToInnerSurface;
+
+                if (penetration > 0.005) { 
+                    playerMesh.position.addScaledVector(collisionNormalForPush, penetration);
+                    playerCylinderCenter.copy(playerMesh.position).addScaledVector(playerUp, PLAYER_HEIGHT * 0.5);
+
+                    const velocityDotNormal = playerVelocity.dot(collisionNormalForPush);
+                    if (velocityDotNormal < 0) {
+                        playerVelocity.addScaledVector(collisionNormalForPush, -velocityDotNormal);
+                    }
+                }
+            }
+            // --- End of Wall Collision --- 
+            
+            // Re-evaluate onGround status for the next frame after all position corrections
+            let currentlyOnGroundPostCollision = false;
+            const groundCheckRaycaster = new THREE.Raycaster(playerMesh.position, localDownWorld, 0, PLAYER_HEIGHT * 0.5 + 0.1); // Ray slightly longer than half height
+            
+            let floorMeshesForGroundCheck = [];
+            if (activeMazeFaceData && activeMazeFaceData.floorMesh) {
+                floorMeshesForGroundCheck.push(activeMazeFaceData.floorMesh);
+            } else {
+                // Fallback if no active maze floor, check all maze floors (less efficient but a failsafe)
+                mazesData.forEach(md => { if (md.floorMesh) floorMeshesForGroundCheck.push(md.floorMesh); });
+            }
+            // Also consider outer cube faces if they can be floors
+            cubeFaces.forEach(cf => {
+                 // Check if this cube face normal is opposite to localDownWorld (i.e., it's a floor candidate)
+                if (cf.normal.dot(localDownWorld.clone().negate()) > 0.9) {
+                    floorMeshesForGroundCheck.push(cf.mesh);
+                }
+            });
+
+            const groundIntersects = groundCheckRaycaster.intersectObjects(floorMeshesForGroundCheck, false); // false = not recursive for these specific meshes
+
+            if (groundIntersects.length > 0) {
+                const closestGround = groundIntersects[0];
+                // Ensure the intersected normal is indeed pointing "up" relative to the player
+                const intersectedWorldNormal = closestGround.face.normal.clone().applyQuaternion(closestGround.object.quaternion).normalize();
+                if (intersectedWorldNormal.dot(playerUp) > 0.7) { // Dot with playerUp (current floor normal)
+                    // Correct slightly if still penetrating after movement
+                    if (closestGround.distance < PLAYER_HEIGHT * 0.5) {
+                         playerMesh.position.addScaledVector(playerUp, PLAYER_HEIGHT * 0.5 - closestGround.distance + 0.001);
+                    }
+                    currentlyOnGroundPostCollision = true;
+                    // If we just landed, ensure downward velocity is killed.
+                    if (playerVelocity.dot(playerUp) < 0) { // if velocity component along playerUp is negative (moving towards floor)
+                        playerVelocity.projectOnPlane(playerUp); // Remove velocity component into the floor
+                    }
+                }
+            }
+            onGround = currentlyOnGroundPostCollision;
+            // --- End of Re-evaluation of onGround --- 
+
+            // The gravity shift checks are here, after all position and velocity adjustments from collisions
+            if (!isGravityShifting && onGround && (clock.getElapsedTime() - lastGravityShiftTriggerTime > GRAVITY_SHIFT_COOLDOWN)) {
+                const playerPos = playerMesh.position; // Use the potentially corrected playerPos
+                const actualEdgeVal = CUBE_SIZE / 2 - WALL_THICKNESS / 2;
+                let newTargetGravity = null;
+
+                let onPositiveY_Face = currentGravityNormal.equals(new THREE.Vector3(0, -1, 0));
+                let onNegativeY_Face = currentGravityNormal.equals(new THREE.Vector3(0, 1, 0));
+                let onPositiveX_Face = currentGravityNormal.equals(new THREE.Vector3(-1, 0, 0));
+                let onNegativeX_Face = currentGravityNormal.equals(new THREE.Vector3(1, 0, 0));
+                let onPositiveZ_Face = currentGravityNormal.equals(new THREE.Vector3(0, 0, -1));
+                let onNegativeZ_Face = currentGravityNormal.equals(new THREE.Vector3(0, 0, 1));
+
+                if (onPositiveY_Face) { 
+                    if (playerPos.x + PLAYER_RADIUS > actualEdgeVal) newTargetGravity = new THREE.Vector3(-1, 0, 0); 
+                    else if (playerPos.x - PLAYER_RADIUS < -actualEdgeVal) newTargetGravity = new THREE.Vector3(1, 0, 0); 
+                    else if (playerPos.z + PLAYER_RADIUS > actualEdgeVal) newTargetGravity = new THREE.Vector3(0, 0, -1); 
+                    else if (playerPos.z - PLAYER_RADIUS < -actualEdgeVal) newTargetGravity = new THREE.Vector3(0, 0, 1);  
+                } else if (onNegativeY_Face) { 
+                    if (playerPos.x + PLAYER_RADIUS > actualEdgeVal) newTargetGravity = new THREE.Vector3(-1, 0, 0);
+                    else if (playerPos.x - PLAYER_RADIUS < -actualEdgeVal) newTargetGravity = new THREE.Vector3(1, 0, 0);
+                    else if (playerPos.z + PLAYER_RADIUS > actualEdgeVal) newTargetGravity = new THREE.Vector3(0, 0, -1);
+                    else if (playerPos.z - PLAYER_RADIUS < -actualEdgeVal) newTargetGravity = new THREE.Vector3(0, 0, 1);
+                } else if (onPositiveX_Face) { 
+                    if (playerPos.y + PLAYER_RADIUS > actualEdgeVal) newTargetGravity = new THREE.Vector3(0, -1, 0); 
+                    else if (playerPos.y - PLAYER_RADIUS < -actualEdgeVal) newTargetGravity = new THREE.Vector3(0, 1, 0);  
+                    else if (playerPos.z + PLAYER_RADIUS > actualEdgeVal) newTargetGravity = new THREE.Vector3(0, 0, -1);
+                    else if (playerPos.z - PLAYER_RADIUS < -actualEdgeVal) newTargetGravity = new THREE.Vector3(0, 0, 1);
+                } else if (onNegativeX_Face) { 
+                    if (playerPos.y + PLAYER_RADIUS > actualEdgeVal) newTargetGravity = new THREE.Vector3(0, -1, 0);
+                    else if (playerPos.y - PLAYER_RADIUS < -actualEdgeVal) newTargetGravity = new THREE.Vector3(0, 1, 0);
+                    else if (playerPos.z + PLAYER_RADIUS > actualEdgeVal) newTargetGravity = new THREE.Vector3(0, 0, -1);
+                    else if (playerPos.z - PLAYER_RADIUS < -actualEdgeVal) newTargetGravity = new THREE.Vector3(0, 0, 1);
+                } else if (onPositiveZ_Face) { 
+                    if (playerPos.x + PLAYER_RADIUS > actualEdgeVal) newTargetGravity = new THREE.Vector3(-1, 0, 0);
+                    else if (playerPos.x - PLAYER_RADIUS < -actualEdgeVal) newTargetGravity = new THREE.Vector3(1, 0, 0);
+                    else if (playerPos.y + PLAYER_RADIUS > actualEdgeVal) newTargetGravity = new THREE.Vector3(0, -1, 0);
+                    else if (playerPos.y - PLAYER_RADIUS < -actualEdgeVal) newTargetGravity = new THREE.Vector3(0, 1, 0);
+                } else if (onNegativeZ_Face) { 
+                    if (playerPos.x + PLAYER_RADIUS > actualEdgeVal) newTargetGravity = new THREE.Vector3(-1, 0, 0);
+                    else if (playerPos.x - PLAYER_RADIUS < -actualEdgeVal) newTargetGravity = new THREE.Vector3(1, 0, 0);
+                    else if (playerPos.y + PLAYER_RADIUS > actualEdgeVal) newTargetGravity = new THREE.Vector3(0, -1, 0);
+                    else if (playerPos.y - PLAYER_RADIUS < -actualEdgeVal) newTargetGravity = new THREE.Vector3(0, 1, 0);
+                }
+
+                if (newTargetGravity && !newTargetGravity.equals(currentGravityNormal)) {
+                    startGravityShift(newTargetGravity);
+                }
+            }
+            // --- End of Revised Boundary Checks ---
+            
+            // Simplified AABB wall collisions against cube outer boundaries - needs refinement for current gravity
+            const outerBoundary = CUBE_SIZE / 2 + WALL_THICKNESS / 2;
+            // This clamping might be too aggressive or incorrect with playerMesh origin at feet
+            // playerMesh.position.x = Math.max(-outerBoundary + PLAYER_RADIUS, Math.min(outerBoundary - PLAYER_RADIUS, playerMesh.position.x));
+            // playerMesh.position.y = Math.max(-outerBoundary, Math.min(outerBoundary - PLAYER_HEIGHT, playerMesh.position.y)); // Y is feet position
+            // playerMesh.position.z = Math.max(-outerBoundary + PLAYER_RADIUS, Math.min(outerBoundary - PLAYER_RADIUS, playerMesh.position.z));
+        }
+
+        // --- Function to initiate gravity shift --- 
+        function startGravityShift(newTargetWorldGravity) {
+            targetGravityNormal.copy(newTargetWorldGravity);
+            isGravityShifting = true;
+            gravityAnimationStartTime = clock.getElapsedTime();
+            lastGravityShiftTriggerTime = gravityAnimationStartTime;
+
+            gravityAnimationStartQuaternion.copy(playerMesh.quaternion);
+            gravityAnimationStartPlayerPosition.copy(playerMesh.position);
+
+            // playerUp is the current world-space "up" vector for the player
+            const oldPlayerWorldUp = playerUp.clone(); 
+            const newPlayerWorldUp = newTargetWorldGravity.clone().negate().normalize();
+
+            const rotationDelta = new THREE.Quaternion();
+            // rotationDelta is the rotation required to change orientation from oldPlayerWorldUp to newPlayerWorldUp
+            rotationDelta.setFromUnitVectors(oldPlayerWorldUp, newPlayerWorldUp);
+
+            // Apply this delta to the player's current orientation to get the target orientation
+            // Q_target = Q_delta_world_rotation * Q_initial_world_orientation
+            gravityAnimationTargetQuaternion.multiplyQuaternions(rotationDelta, gravityAnimationStartQuaternion);
+            
+            // For now, target position is the same as start; stickToSurface will adjust.
+            gravityAnimationTargetPlayerPosition.copy(playerMesh.position); 
+
+            onGround = false; // Player is "falling" during shift
+            playerVelocity.set(0,0,0); // Reset velocity before shift
+            console.log(`Gravity shift INITIATED: From towards ${getFaceName(currentGravityNormal.clone().negate())} -> To towards ${getFaceName(targetGravityNormal.clone().negate())}`);
+            console.log(`Player pos at shift start: ${playerPosToString(playerMesh.position)}, Target Grav: ${vec3ToString(targetGravityNormal)}`);
+        }
+
+        // --- Maze Generation Functions ---
+        function generateMaze2D(width, height) {
+            const grid = Array(height).fill(null).map(() => Array(width).fill(null).map(() => ({
+                visited: false,
+                walls: { north: true, south: true, east: true, west: true }
+            })));
+
+            function carvePassages(cx, cy, grid) {
+                grid[cy][cx].visited = true;
+                const directions = [
+                    { x: 0, y: -1, wall: 'north', oppositeWall: 'south' }, // North
+                    { x: 1, y: 0, wall: 'east', oppositeWall: 'west' },   // East
+                    { x: 0, y: 1, wall: 'south', oppositeWall: 'north' }, // South
+                    { x: -1, y: 0, wall: 'west', oppositeWall: 'east' }  // West
+                ];
+                directions.sort(() => Math.random() - 0.5); // Shuffle directions
+
+                for (const dir of directions) {
+                    const nx = cx + dir.x;
+                    const ny = cy + dir.y;
+
+                    if (ny >= 0 && ny < height && nx >= 0 && nx < width && !grid[ny][nx].visited) {
+                        grid[cy][cx].walls[dir.wall] = false;
+                        grid[ny][nx].walls[dir.oppositeWall] = false;
+                        carvePassages(nx, ny, grid);
+                    }
+                }
+            }
+
+            carvePassages(0, 0, grid); // Start carving from (0,0)
+            return grid;
+        }
+
+        function initMazes() {
+            console.log("Initializing mazes...");
+            const faceNormals = [
+                { name: "Top (+Y)", normal: new THREE.Vector3(0, 1, 0) },
+                { name: "Bottom (-Y)", normal: new THREE.Vector3(0, -1, 0) },
+                { name: "Right (+X)", normal: new THREE.Vector3(1, 0, 0) },
+                { name: "Left (-X)", normal: new THREE.Vector3(-1, 0, 0) },
+                { name: "Front (+Z)", normal: new THREE.Vector3(0, 0, 1) },
+                { name: "Back (-Z)", normal: new THREE.Vector3(0, 0, -1) }
+            ];
+
+            mazesData = faceNormals.map(faceInfo => ({
+                ...faceInfo,
+                grid2D: generateMaze2D(MAZE_GRID_SIZE, MAZE_GRID_SIZE),
+                floorMesh: null, // Initialize floorMesh reference
+                mazeWalls: new THREE.Group() // Group to hold maze walls for this face
+            }));
+
+            // Placeholder for connectMazeFaces() and buildMaze3D()
+            console.log("2D Mazes generated:", mazesData);
+            buildMaze3D(); // Call build after generation (will be simple initially)
+        }
+
+        function buildMaze3D() {
+            console.log("Building 3D maze geometry...");
+            const wallMaterial = new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
+            const floorMaterial = new THREE.MeshStandardMaterial({ color: 0x666666 }); // Maze floor material
+
+            mazesData.forEach(mazeFaceData => {
+                const { normal, grid2D, name } = mazeFaceData;
+                const faceGroup = new THREE.Group();
+                scene.add(faceGroup);
+
+                const faceCenterOffset = CUBE_SIZE / 2 - WALL_THICKNESS / 2;
+                faceGroup.position.copy(normal).multiplyScalar(faceCenterOffset);
+                faceGroup.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal.clone().normalize());
+
+                const floorThickness = 0.1;
+                const mazeFloor = new THREE.Mesh(
+                    new THREE.BoxGeometry(CUBE_SIZE, CUBE_SIZE, floorThickness),
+                    floorMaterial
+                );
+                mazeFloor.position.set(0, 0, -floorThickness / 2);
+                faceGroup.add(mazeFloor);
+                mazeFaceData.floorMesh = mazeFloor; // Store reference to the floor mesh
+
+                // Add the group for this face's maze walls to the faceGroup
+                faceGroup.add(mazeFaceData.mazeWalls);
+
+                for (let r = 0; r < MAZE_GRID_SIZE; r++) {
+                    for (let c = 0; c < MAZE_GRID_SIZE; c++) {
+                        const cellData = grid2D[r][c];
+
+                        // Calculate cell center in the local XY plane of the faceGroup
+                        // (0,0) of the grid is bottom-left for local rendering.
+                        const localX = (c - MAZE_GRID_SIZE / 2 + 0.5) * MAZE_CELL_SIZE;
+                        const localY = (r - MAZE_GRID_SIZE / 2 + 0.5) * MAZE_CELL_SIZE;
+
+                        if (cellData.walls.north) {
+                            const wall = new THREE.Mesh(
+                                new THREE.BoxGeometry(MAZE_CELL_SIZE, MAZE_WALL_THICKNESS, MAZE_WALL_HEIGHT),
+                                wallMaterial
+                            );
+                            wall.position.set(localX, localY + MAZE_CELL_SIZE / 2 - MAZE_WALL_THICKNESS / 2, MAZE_WALL_HEIGHT / 2);
+                            // Wall is oriented along X, thickness along Y, height along Z (local to faceGroup before faceGroup rotation)
+                            // Ah, BoxGeometry is width, height, depth. So (MAZE_CELL_SIZE (width), MAZE_WALL_HEIGHT, MAZE_WALL_THICKNESS)
+                            // if Z of faceGroup is outward normal. So wall.position.z is MAZE_WALL_HEIGHT/2.
+                            // Let's re-think geometry and local wall positions.
+                            // Maze Walls are upright. Local Z of faceGroup is outward normal.
+                            // So walls are in local XY plane, extruded along local Z (which becomes MAZE_WALL_HEIGHT).
+                            // This means BoxGeometry should be (length, width, height_of_wall).
+                            // North wall: length MAZE_CELL_SIZE (along X), width MAZE_WALL_THICKNESS, height MAZE_WALL_HEIGHT
+                            const northWall = new THREE.Mesh(
+                                new THREE.BoxGeometry(MAZE_CELL_SIZE, MAZE_WALL_THICKNESS, MAZE_WALL_HEIGHT),
+                                wallMaterial
+                            );
+                            northWall.position.set(localX, localY + MAZE_CELL_SIZE / 2, MAZE_WALL_HEIGHT / 2);
+                            mazeFaceData.mazeWalls.add(northWall); // Add to the face's wall group
+                        }
+
+                        if (cellData.walls.south) {
+                            const southWall = new THREE.Mesh(
+                                new THREE.BoxGeometry(MAZE_CELL_SIZE, MAZE_WALL_THICKNESS, MAZE_WALL_HEIGHT),
+                                wallMaterial
+                            );
+                            southWall.position.set(localX, localY - MAZE_CELL_SIZE / 2, MAZE_WALL_HEIGHT / 2);
+                            mazeFaceData.mazeWalls.add(southWall); // Add to the face's wall group
+                        }
+
+                        if (cellData.walls.east) {
+                            const eastWall = new THREE.Mesh(
+                                new THREE.BoxGeometry(MAZE_WALL_THICKNESS, MAZE_CELL_SIZE, MAZE_WALL_HEIGHT),
+                                wallMaterial
+                            );
+                            eastWall.position.set(localX + MAZE_CELL_SIZE / 2, localY, MAZE_WALL_HEIGHT / 2);
+                            mazeFaceData.mazeWalls.add(eastWall); // Add to the face's wall group
+                        }
+
+                        if (cellData.walls.west) {
+                            const westWall = new THREE.Mesh(
+                                new THREE.BoxGeometry(MAZE_WALL_THICKNESS, MAZE_CELL_SIZE, MAZE_WALL_HEIGHT),
+                                wallMaterial
+                            );
+                            westWall.position.set(localX - MAZE_CELL_SIZE / 2, localY, MAZE_WALL_HEIGHT / 2);
+                            mazeFaceData.mazeWalls.add(westWall); // Add to the face's wall group
+                        }
+                    }
+                }
+            });
+            console.log("3D Maze build attempt complete.");
+        }
+
+        function createHollowCube() { // This function will be replaced/removed
+            // ... existing code ...
+        }
+
+    </script>
+</body>
+</html> 
