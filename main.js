@@ -7,6 +7,7 @@ import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import { VRButton } from 'three/addons/webxr/VRButton.js'; // Add WebXR VR Button
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js'; // Add Controller Models
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js'; // Add GLTF Loader for 3D models
 
 // Scene, Camera, Renderer
 let scene, camera, renderer;
@@ -24,6 +25,11 @@ const playerHeight = 1.8; // Approximate height of the camera from the ground
 let playerVerticalVelocity = 0.0; // NEW: For jump mechanics
 let isJumping = false; // NEW: Jump state
 
+// Flying in VR
+let isFlying = false;
+const FLY_SPEED = 5.0; // Speed of vertical movement when flying
+const FLY_GRAVITY = 9.8; // Gravity to apply when not flying
+
 const PLAYER_RADIUS = 0.3; // NEW: For XZ collision
 
 // Objects
@@ -34,7 +40,7 @@ let echoableObjects = []; // To store floor, pillars, etc.
 // Particle System for Echo
 let particleSystem;
 const MAX_PARTICLES = 50000; // Max particles in the pool
-const PARTICLES_PER_ECHO = 5000; // REDUCED for quicker echo completion (was 20000)
+const PARTICLES_PER_ECHO = 15000; // REDUCED for quicker echo completion (was 20000)
 
 // Input state
 const keyboardState = {};
@@ -52,7 +58,7 @@ const PROJECTILE_ECHO_PARTICLE_MULTIPLIER = 3.0; // INCREASED: Cast more particl
 
 // NOW DEFINE PARTICLE CONSTANTS THAT DEPEND ON THE ABOVE
 const PARTICLE_INITIAL_LIFE = ECHO_FADE_IN_DURATION + ECHO_HOLD_DURATION + ECHO_FADE_DURATION; // Total lifespan 4.3s
-const PARTICLE_BASE_SIZE = 0.03; 
+const PARTICLE_BASE_SIZE = 0.07;
 
 // Lifecycle stages (based on life REMAINING)
 const LIFESTAGE_FADEOUT_THRESHOLD = ECHO_FADE_DURATION; // When life <= this, particle is fading out (e.g., 4.0s)
@@ -60,8 +66,8 @@ const LIFESTAGE_HOLD_THRESHOLD = ECHO_FADE_DURATION + ECHO_HOLD_DURATION; // Whe
 // Fade-in happens when life > LIFESTAGE_HOLD_THRESHOLD
 
 // Distance-based decay constants
-const MAX_ECHO_DISTANCE_FOR_DECAY = 35.0; // Should match raycaster.far or desired max effect distance
-const DISTANCE_DECAY_RATE_MULTIPLIER = 3.0; // For particles at echo origin, life decays (1+X) times faster. X is this value. (e.g. 3.0 means 4x faster)
+const MAX_ECHO_DISTANCE_FOR_DECAY = 265.0; // Should match raycaster.far or desired max effect distance
+const DISTANCE_DECAY_RATE_MULTIPLIER = 1.5; // Reduced from 3.0 to make particles last longer at distance
 
 // Timing
 const clock = new THREE.Clock();
@@ -164,9 +170,9 @@ const POWERUP_COLOR = new THREE.Color(0xff0000); // Red
 const NORMAL_ECHO_COLOR = new THREE.Color(0x00ffff); // Existing echo color
 const PROJECTILE_ECHO_PARTICLE_COLOR = new THREE.Color(0x800080); // Purple for projectile echo particles
 const PROJECTILE_PICKUP_VISIBLE_COLOR = new THREE.Color(0x6A0DAD); // Visible purple for the pickup item
-const POWERUP_RAYCASTER_FAR = 15.0;
-const NORMAL_RAYCASTER_FAR = 35.0; // Default echo range
-const PROJECTILE_ECHO_RAYCASTER_FAR = 45.0; // NEW: Dedicated far distance for projectile echo
+const POWERUP_RAYCASTER_FAR = 30.0; // Increased from 15.0
+const NORMAL_RAYCASTER_FAR = 100.0; // Increased from 35.0 to illuminate more of the maze while flying
+const PROJECTILE_ECHO_RAYCASTER_FAR = 120.0; // Increased from 45.0 for better visibility
 let POWERUP_ECHO_FADE_DURATION; // Will be set in init based on ECHO_FADE_DURATION
 
 let powerUpSphereMesh;
@@ -189,10 +195,13 @@ let deathMessageElement;
 let tossedProjectileMeshes = []; // Array of projectile meshes
 let tossedProjectileVelocities = []; // Array of velocities
 let projectileCurrentLives = []; // Array of lifetimes
+let projectileTrails = []; // Array of trail effects for projectiles
 let isProjectileInFlight = false; // Flag for any projectile in flight
 const MAX_PROJECTILES = 5; // Maximum number of projectiles allowed in flight
 const PROJECTILE_SPEED = 25.0;
 const PROJECTILE_MAX_LIFE = 3.0; // seconds
+const TRAIL_LENGTH = 10; // Number of segments in the trail
+const TRAIL_OPACITY = 0.7; // Starting opacity of the trail
 
 // Mini-map variables
 let miniMapCanvas;
@@ -209,7 +218,8 @@ let vrControllerInputs = {
     right: {
         thumbstickX: 0,
         thumbstickY: 0,
-        thumbstickPressed: false
+        thumbstickPressed: false,
+        flyButtonPressed: false // Secondary trigger for flying
     }
 };
 
@@ -229,6 +239,12 @@ const VR_SMOOTH_TURN_DEADZONE = 0.1;   // Stick deflection below this value will
 // NEW: Array to track active impact flashes for guaranteed cleanup
 let activeImpactFlashes = [];
 const MAX_FLASH_AGE = 500; // milliseconds
+
+// GLTF Model variables
+let yantraModels = []; // Array to store the loaded GLTF models
+let powerUpYantraModel; // Reference to the red power-up model
+let projectilePowerUpYantraModel; // Reference to the purple power-up model
+const YANTRA_ROTATION_SPEED = 1.0; // Rotation speed in radians per second
 
 // NEW: Puzzle Door Constants and State
 let puzzleDoorMesh, puzzleDoorTarget1Mesh, puzzleDoorTarget2Mesh;
@@ -262,6 +278,190 @@ let doorOpenSoundBuffer = null;
 
 // Function declarations moved BEFORE init()
 
+// Function to load GLTF models
+function loadYantraModels() {
+    const loader = new GLTFLoader();
+
+    // Load the first yantra model (for red power-up)
+    loader.load(
+        'assets/yantra1.gltf',
+        function (gltf) {
+            console.log("Yantra1 model loaded successfully");
+            const model = gltf.scene;
+
+            // Apply fresnel shader to all meshes in the model
+            model.traverse((child) => {
+                if (child.isMesh) {
+                    // Create fresnel shader material with higher intensity for better visibility at small scale
+                    const fresnelMaterial = createFresnelMaterial(POWERUP_COLOR, 1.5);
+                    child.material = fresnelMaterial;
+                }
+            });
+
+            // Scale and position the model appropriately - much smaller scale
+            model.scale.set(0.002, 0.002, 0.002);
+
+            // Store the model
+            yantraModels[0] = model;
+
+            // If the power-up mesh already exists, replace it with the model
+            if (powerUpSphereMesh) {
+                // Copy position from the existing sphere
+                model.position.copy(powerUpSphereMesh.position);
+
+                // Remove the old sphere from the scene
+                scene.remove(powerUpSphereMesh);
+
+                // Add the new model to the scene
+                scene.add(model);
+
+                // Update the reference
+                powerUpYantraModel = model;
+                powerUpSphereMesh = model;
+
+                // Update the userData for collision detection
+                powerUpSphereMesh.userData.aabb = new THREE.Box3().setFromObject(powerUpSphereMesh);
+                powerUpSphereMesh.userData.isPowerUp = true;
+
+                // Add to echoable objects
+                if (!echoableObjects.includes(powerUpSphereMesh)) {
+                    echoableObjects.push(powerUpSphereMesh);
+                }
+
+                console.log("Red power-up model replaced with Yantra1");
+            }
+        },
+        function (xhr) {
+            console.log((xhr.loaded / xhr.total * 100) + '% loaded - Yantra1');
+        },
+        function (error) {
+            console.error('Error loading Yantra1 model:', error);
+        }
+    );
+
+    // Load the second yantra model (for purple power-up)
+    loader.load(
+        'assets/yantra2.gltf',
+        function (gltf) {
+            console.log("Yantra2 model loaded successfully");
+            const model = gltf.scene;
+
+            // Apply fresnel shader to all meshes in the model
+            model.traverse((child) => {
+                if (child.isMesh) {
+                    // Create fresnel shader material with purple color and higher intensity
+                    const fresnelMaterial = createFresnelMaterial(PROJECTILE_PICKUP_VISIBLE_COLOR, 1.0);
+                    child.material = fresnelMaterial;
+                }
+            });
+
+            // Scale and position the model appropriately - much smaller scale
+            model.scale.set(0.002, 0.002, 0.002);
+
+            // Store the model
+            yantraModels[1] = model;
+
+            // If the projectile power-up mesh already exists, replace it with the model
+            if (projectilePowerUpSphereMesh) {
+                // Copy position from the existing sphere
+                model.position.copy(projectilePowerUpSphereMesh.position);
+
+                // Remove the old sphere from the scene
+                scene.remove(projectilePowerUpSphereMesh);
+
+                // Add the new model to the scene
+                scene.add(model);
+
+                // Update the reference
+                projectilePowerUpYantraModel = model;
+                projectilePowerUpSphereMesh = model;
+
+                // Update the userData for collision detection
+                projectilePowerUpSphereMesh.userData.aabb = new THREE.Box3().setFromObject(projectilePowerUpSphereMesh);
+                projectilePowerUpSphereMesh.userData.isProjectilePowerUp = true;
+
+                // Add to echoable objects
+                if (!echoableObjects.includes(projectilePowerUpSphereMesh)) {
+                    echoableObjects.push(projectilePowerUpSphereMesh);
+                }
+
+                console.log("Purple power-up model replaced with Yantra2");
+            }
+        },
+        function (xhr) {
+            console.log((xhr.loaded / xhr.total * 100) + '% loaded - Yantra2');
+        },
+        function (error) {
+            console.error('Error loading Yantra2 model:', error);
+        }
+    );
+}
+
+// Function to create a fresnel shader material
+function createFresnelMaterial(color, intensity) {
+    // Create a custom shader material with true fresnel edge glow effect
+    return new THREE.ShaderMaterial({
+        uniforms: {
+            emissiveColor: { value: new THREE.Color(color) },
+            time: { value: 0.0 },
+            intensity: { value: intensity }
+        },
+        vertexShader: `
+            uniform float time;
+            varying vec3 vNormal;
+            varying vec3 vViewPosition;
+
+            void main() {
+                vNormal = normalize(normalMatrix * normal);
+                vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                vViewPosition = -mvPosition.xyz;
+                gl_Position = projectionMatrix * mvPosition;
+            }
+        `,
+        fragmentShader: `
+            uniform vec3 emissiveColor;
+            uniform float time;
+            uniform float intensity;
+
+            varying vec3 vNormal;
+            varying vec3 vViewPosition;
+
+            void main() {
+                // Calculate true fresnel effect
+                vec3 normal = normalize(vNormal);
+                vec3 viewDirection = normalize(vViewPosition);
+
+                // Fresnel calculation - stronger at edges, weaker at center
+                // Increased power for more dramatic edge effect
+                float fresnel = pow(1.0 - clamp(dot(normal, viewDirection), 0.0, 1.0), 4.0);
+
+                // Pulsating effect
+                float pulse = sin(time * 2.0) * 0.5 + 0.5;
+
+                // Combine for final effect
+                // Center is almost completely transparent, edges are more opaque
+                float opacity = mix(0.0, 0.9, fresnel);
+
+                // Add pulsing to opacity
+                opacity = opacity * (0.6 + pulse * 0.4);
+
+                // Emissive color is stronger at edges
+                vec3 finalColor = emissiveColor * (0.3 + fresnel * 2.0);
+
+                // Add pulsing to color intensity
+                finalColor = finalColor * (0.7 + pulse * 0.5);
+
+                // Final color with proper opacity
+                gl_FragColor = vec4(finalColor, opacity * intensity);
+            }
+        `,
+        transparent: true,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending, // Use additive blending for glow effect
+        depthWrite: false // Important for proper transparency rendering
+    });
+}
+
 function easeOutCubic(t) { // t is from 0 to 1
     return 1 - Math.pow(1 - t, 3);
 }
@@ -273,7 +473,7 @@ function scheduleBeatSoundStart() {
         startBeatSoundTimeout = null;
     }
 
-    // --- MODIFIED: Play immediately if power-up active and sound is loaded & paused --- 
+    // --- MODIFIED: Play immediately if power-up active and sound is loaded & paused ---
     if (isProjectileEchoPowerUpActive && backgroundBeatSound && backgroundBeatSound.readyState >= 2 && backgroundBeatSound.paused) {
         console.log("[scheduleBeatSoundStart] Attempting to play backgroundBeatSound immediately.");
         backgroundBeatSound.play().then(() => {
@@ -315,7 +515,7 @@ function stopBeatSound() {
 }
 
 const raycaster = new THREE.Raycaster();
-let particleIndex = 0; 
+let particleIndex = 0;
 
 // NEW: Function to load and decode audio for Web Audio API
 async function loadAudioBuffer(url) {
@@ -344,7 +544,7 @@ const PARTICLES_PER_FRAME = 10000; // GREATLY increased for much faster echo pro
 // Modify the triggerEcho function to queue requests instead of processing immediately
 function triggerEcho(originPoint, echoColorOverride) {
     if (isPlayerDead) return;
-    if (!audioContext) { 
+    if (!audioContext) {
         console.warn("AudioContext not ready, cannot play echo sound.");
         return;
     }
@@ -356,7 +556,7 @@ function triggerEcho(originPoint, echoColorOverride) {
 
     // Sound Playback Logic - MOVED to the beginning of the function
     let soundBufferToPlay = null;
-    let soundFileName = ""; 
+    let soundFileName = "";
 
     if (echoColorOverride === PROJECTILE_ECHO_PARTICLE_COLOR) { // Check for projectile echo first
         if (projectileEchoNoteFilenames.length > 0) {
@@ -383,14 +583,14 @@ function triggerEcho(originPoint, echoColorOverride) {
         const source = audioContext.createBufferSource();
         source.buffer = soundBufferToPlay;
         source.connect(audioContext.destination);
-        source.start(0); 
+        source.start(0);
     } else if (soundFileName) {
         console.warn(`Audio buffer for ${soundFileName} not found or not loaded yet.`);
     }
 
     // Determine number of particles to cast for this specific echo
     let numParticlesToCast = PARTICLES_PER_ECHO;
-    
+
     // SIMPLIFIED: Use same particle count for all echo types for consistency
     // No special multiplier for projectile echo
 
@@ -400,7 +600,7 @@ function triggerEcho(originPoint, echoColorOverride) {
 
     if (echoColorOverride) { // Projectile echo uses its specific color
         currentEchoColorToUse = echoColorOverride;
-        currentRaycasterFar = PROJECTILE_ECHO_RAYCASTER_FAR; 
+        currentRaycasterFar = PROJECTILE_ECHO_RAYCASTER_FAR;
     } else if (isPowerUpActive) { // Red power-up (shorter range, different particle color)
         currentEchoColorToUse = POWERUP_COLOR; // Red particles for red power-up
         currentRaycasterFar = POWERUP_RAYCASTER_FAR;
@@ -428,42 +628,42 @@ function triggerEcho(originPoint, echoColorOverride) {
 // Add a new function to process echo particles progressively
 function processEchoParticles() {
     if (pendingEchoes.length === 0) return;
-    
+
     // Process the oldest echo request first
     const echo = pendingEchoes[0];
-    
+
     // Set up raycaster with the appropriate distance
     raycaster.far = echo.raycasterFar;
-    
+
     const posArray = particleSystem.geometry.attributes.position.array;
     const colArray = particleSystem.geometry.attributes.color.array;
     const sizeArray = particleSystem.geometry.attributes.size.array;
     const lifeArray = particleSystem.geometry.attributes.life.array;
     const echoDistanceArray = particleSystem.geometry.attributes.echoDistance.array;
-    
+
     let particlesActivatedThisBatch = 0;
-    
+
     // SIMPLIFIED: All echo types process the same number of particles per frame
     const particlesToProcess = Math.min(PARTICLES_PER_FRAME, echo.particlesRemaining);
-    
+
     // Check if this is a projectile echo (purple)
     const isPurpleEcho = echo.color.equals(PROJECTILE_ECHO_PARTICLE_COLOR);
-    
+
     // Process a batch of particles
     for (let i = 0; i < particlesToProcess; i++) {
         // Calculate particle index relative to the total for this echo
         const relativeIndex = echo.startIndex + i;
-        
+
         // Generate ray direction using spherical coordinates for even distribution
         const phi = Math.acos(-1 + (2 * relativeIndex) / echo.particlesTotal);
         const theta = Math.sqrt(echo.particlesTotal * Math.PI) * phi;
-        
+
         const direction = new THREE.Vector3(
             Math.cos(theta) * Math.sin(phi),
             Math.sin(theta) * Math.sin(phi),
             Math.cos(phi)
         );
-        
+
         raycaster.set(echo.origin, direction);
         const intersects = raycaster.intersectObjects(echoableObjects, false);
 
@@ -486,7 +686,7 @@ function processEchoParticles() {
             colArray[pIdx * 4 + 0] = finalParticleColor.r;
             colArray[pIdx * 4 + 1] = finalParticleColor.g;
             colArray[pIdx * 4 + 2] = finalParticleColor.b;
-            
+
             // IMPROVED: Start purple projectile particles with higher initial alpha
             if (isPurpleEcho) {
                 colArray[pIdx * 4 + 3] = 0.6; // Start more visible for projectiles
@@ -496,30 +696,30 @@ function processEchoParticles() {
                 colArray[pIdx * 4 + 3] = 0.0; // Start invisible and fade in
                 sizeArray[pIdx] = 0.0; // Start with zero size and grow
             }
-            
+
             lifeArray[pIdx] = PARTICLE_INITIAL_LIFE;
-            
-            const distance = point.distanceTo(echo.origin); 
+
+            const distance = point.distanceTo(echo.origin);
             echoDistanceArray[pIdx] = distance;
-            
+
             particleIndex++;
         }
     }
-    
+
     // Update echo request
     echo.startIndex += particlesToProcess;
     echo.particlesRemaining -= particlesToProcess;
-    
+
     // Update buffers if any particles were created
     if (particlesActivatedThisBatch > 0) {
         particleSystem.geometry.attributes.position.needsUpdate = true;
         particleSystem.geometry.attributes.color.needsUpdate = true;
         particleSystem.geometry.attributes.size.needsUpdate = true;
-        particleSystem.geometry.attributes.life.needsUpdate = true; 
-        particleSystem.geometry.attributes.echoDistance.needsUpdate = true; 
+        particleSystem.geometry.attributes.life.needsUpdate = true;
+        particleSystem.geometry.attributes.echoDistance.needsUpdate = true;
         particleSystem.geometry.computeBoundingSphere();
     }
-    
+
     // If this echo is finished, remove from queue
     if (echo.particlesRemaining <= 0) {
         // Just remove this echo from the queue
@@ -556,11 +756,11 @@ function init() {
 
     // Create scene
     scene = new THREE.Scene();
-    
+
     // Camera with your original settings
     camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, NORMAL_RAYCASTER_FAR);
     camera.position.set(2, playerHeight, 18); // Start position for maze
-    
+
     // Renderer - maintain original canvas reference and properties
     const canvas = document.getElementById('gameCanvas');
     renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
@@ -569,18 +769,18 @@ function init() {
     renderer.setClearColor(0x000000); // Black background
     renderer.shadowMap.enabled = true;
     renderer.xr.enabled = true; // Enable WebXR
-    
+
     // Add VR button and handle session change events
     document.body.appendChild(VRButton.createButton(renderer));
     renderer.xr.addEventListener('sessionstart', () => onVRSessionChange(renderer.xr.getSession()));
     renderer.xr.addEventListener('sessionend', () => onVRSessionChange(null));
-    
+
     // VR-specific variables
     isInVR = false;
-    
+
     // Setup VR controllers
     setupVRControllers();
-    
+
     // Basic Ambient Light (very dim)
     const ambientLight = new THREE.AmbientLight(0x050505); // Even dimmer, relying on particles
     scene.add(ambientLight);
@@ -593,32 +793,32 @@ function init() {
         metalness: 0.1,
     };
     // floor = new THREE.Mesh(floorGeometry, floorMaterial);
-    // floor.rotation.x = -Math.PI / 2; 
+    // floor.rotation.x = -Math.PI / 2;
     // scene.add(floor);
     // echoableObjects.push(floor);
 
     createSegmentedFloorWithPit(
         100, // total width of the area including pit
         100, // total depth of the area including pit
-        PIT_CENTER_X, 
-        PIT_CENTER_Z, 
-        PIT_SIZE, 
+        PIT_CENTER_X,
+        PIT_CENTER_Z,
+        PIT_SIZE,
         baseMaterialProps
     );
 
     // Create Power-up Sphere - NEW
     POWERUP_ECHO_FADE_DURATION = ECHO_FADE_DURATION * 2.5; // Define it here
     const sphereGeometry = new THREE.SphereGeometry(0.5, 16, 16); // Restored original size
-    const sphereMaterial = new THREE.MeshStandardMaterial({ 
+    const sphereMaterial = new THREE.MeshStandardMaterial({
         color: 0x222222, // Dark grey, like walls
         emissive: 0x000000, // No self-glow initially
         emissiveIntensity: 0 // No self-glow initially
     });
     powerUpSphereMesh = new THREE.Mesh(sphereGeometry, sphereMaterial);
     // NEW Position: Center of the first large room
-    powerUpSphereMesh.position.set(-7.5, playerHeight, 0.0); 
+    powerUpSphereMesh.position.set(-7.5, playerHeight, 0.0);
     scene.add(powerUpSphereMesh);
-    echoableObjects.push(powerUpSphereMesh); 
+    echoableObjects.push(powerUpSphereMesh);
     powerUpSphereMesh.userData.aabb = new THREE.Box3().setFromObject(powerUpSphereMesh);
     powerUpSphereMesh.userData.isPowerUp = true; // Tag it
     console.log("Power-up sphere (red) created at:", powerUpSphereMesh.position);
@@ -633,12 +833,15 @@ function init() {
     });
     projectilePowerUpSphereMesh = new THREE.Mesh(projectileSphereGeometry, projectileSphereMaterial);
     // Position: Back near the red sphere for easier testing
-    projectilePowerUpSphereMesh.position.set(-5.0, playerHeight, 0.0); 
+    projectilePowerUpSphereMesh.position.set(-5.0, playerHeight, 0.0);
     scene.add(projectilePowerUpSphereMesh);
     echoableObjects.push(projectilePowerUpSphereMesh);
     projectilePowerUpSphereMesh.userData.aabb = new THREE.Box3().setFromObject(projectilePowerUpSphereMesh);
     projectilePowerUpSphereMesh.userData.isProjectilePowerUp = true; // Tag it
     console.log("Projectile Power-up sphere (purple) created at:", projectilePowerUpSphereMesh.position);
+
+    // Load GLTF models to replace the sphere pickups
+    loadYantraModels();
 
     // Maze Walls - MOVED after power-up creation
     buildMaze(); // Call function to construct the maze
@@ -670,14 +873,34 @@ function init() {
     particleGeometry.setAttribute('life', new THREE.BufferAttribute(life, 1));
     particleGeometry.setAttribute('echoDistance', new THREE.BufferAttribute(echoDistances, 1)); // NEW
 
+    // Create a circular particle texture
+    const particleCanvas = document.createElement('canvas');
+    particleCanvas.width = 64;
+    particleCanvas.height = 64;
+    const context = particleCanvas.getContext('2d');
+
+    // Draw a circular gradient
+    const gradient = context.createRadialGradient(32, 32, 0, 32, 32, 32);
+    gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
+    gradient.addColorStop(0.3, 'rgba(255, 255, 255, 0.8)');
+    gradient.addColorStop(0.7, 'rgba(255, 255, 255, 0.3)');
+    gradient.addColorStop(1, 'rgba(255, 255, 255, 0)');
+
+    context.fillStyle = gradient;
+    context.fillRect(0, 0, 64, 64);
+
+    // Create texture from canvas
+    const particleTexture = new THREE.CanvasTexture(particleCanvas);
+
     const particleMaterial = new THREE.PointsMaterial({
-        size: PARTICLE_BASE_SIZE, 
-        vertexColors: true, 
+        size: PARTICLE_BASE_SIZE,
+        vertexColors: true,
         transparent: true,  // ENABLE TRANSPARENCY
         depthWrite: false, // RECOMMENDED FOR TRANSPARENT PARTICLES
-        // blending: THREE.AdditiveBlending, // Optional: for a glowier effect, try later if desired
+        blending: THREE.AdditiveBlending, // Enable additive blending for a glowier effect
         opacity: 1.0, // Material base opacity, per-particle alpha will modulate this
         sizeAttenuation: true,
+        map: particleTexture // Apply the circular texture
     });
     console.log("Particle material: transparent=true, depthWrite=false, vertexColors=true");
 
@@ -714,14 +937,14 @@ function init() {
         if (!controls.isLocked) {
             controls.lock();
         }
-        
+
         // MODIFIED: Handle click based on projectile power-up state
         if (isProjectileEchoPowerUpActive && !isProjectileInFlight) {
             throwProjectile();
             // Echo will be triggered by projectile impact, not directly on click here
         } else {
             // Standard echo from player
-            triggerEcho(); 
+            triggerEcho();
         }
     });
 
@@ -912,7 +1135,7 @@ function handlePlayerMovement(deltaTime) {
     if (!controls.isLocked) {
         playerVelocity.set(0,0,0); // Stop all horizontal movement if not locked
         // Still process vertical movement (gravity/jump landing) if needed
-        // For now, we will also stop vertical processing if not locked for simplicity, 
+        // For now, we will also stop vertical processing if not locked for simplicity,
         // but this might change if e.g. player can fall while menu is open.
     } else {
         // --- Horizontal Movement (with momentum) ---
@@ -957,8 +1180,8 @@ function handlePlayerMovement(deltaTime) {
         }
 
         // Determine current max speed (sprint or normal)
-        const currentMaxSpeed = (keyboardState['ShiftLeft'] || keyboardState['ShiftRight']) 
-                                ? playerSpeed * PLAYER_SPRINT_MULTIPLIER 
+        const currentMaxSpeed = (keyboardState['ShiftLeft'] || keyboardState['ShiftRight'])
+                                ? playerSpeed * PLAYER_SPRINT_MULTIPLIER
                                 : playerSpeed;
 
         // Cap speed
@@ -977,8 +1200,8 @@ function handlePlayerMovement(deltaTime) {
                              keyboardState['KeyD'] || keyboardState['ArrowRight']) && controls.isLocked;
 
         const shouldPlayFootsteps = wantsToMove && isMovingHorizontally;
-        const targetPlaybackRate = (keyboardState['ShiftLeft'] || keyboardState['ShiftRight']) 
-                                   ? FOOTSTEP_SPRINT_PLAYBACK_RATE 
+        const targetPlaybackRate = (keyboardState['ShiftLeft'] || keyboardState['ShiftRight'])
+                                   ? FOOTSTEP_SPRINT_PLAYBACK_RATE
                                    : FOOTSTEP_BASE_PLAYBACK_RATE;
 
         if (shouldPlayFootsteps) {
@@ -1010,7 +1233,7 @@ function handlePlayerMovement(deltaTime) {
                 // Fade out
                 footstepGainNode.gain.cancelScheduledValues(audioContext.currentTime);
                 footstepGainNode.gain.linearRampToValueAtTime(0.0, audioContext.currentTime + FOOTSTEP_FADE_DURATION_MS / 1000);
-                
+
                 if (!stopFootstepTimeout) { // Schedule stop only if not already scheduled
                     stopFootstepTimeout = setTimeout(() => {
                         if (footstepSourceNode) {
@@ -1098,7 +1321,7 @@ function handlePlayerMovement(deltaTime) {
             powerUpRemainingTime = POWERUP_DURATION;
             powerUpSphereMesh.visible = false;
             console.log("Red Power-up collected!");
-            
+
             if (pickupSoundBuffer && audioContext) {
                 const source = audioContext.createBufferSource();
                 source.buffer = pickupSoundBuffer;
@@ -1159,7 +1382,7 @@ function handlePlayerMovement(deltaTime) {
         if (playerVerticalVelocity <= 0) { // Only check for landing if moving downwards or at apex
             // AABB for the player's feet at the potential new position (thin box)
             const playerFeetAABB = new THREE.Box3(
-                 new THREE.Vector3(camera.position.x - PLAYER_RADIUS, potentialPlayerFeetY - 0.05, camera.position.z - PLAYER_RADIUS), 
+                 new THREE.Vector3(camera.position.x - PLAYER_RADIUS, potentialPlayerFeetY - 0.05, camera.position.z - PLAYER_RADIUS),
                  new THREE.Vector3(camera.position.x + PLAYER_RADIUS, potentialPlayerFeetY + 0.05, camera.position.z + PLAYER_RADIUS)
             );
 
@@ -1195,7 +1418,7 @@ function handlePlayerMovement(deltaTime) {
                 break;
             }
         }
-        
+
         if (!onGround && playerVerticalVelocity <= 0) { // Player is not on any floor segment (e.g., walked off an edge or falling)
             if (!isJumping) { // If not already in a jump (e.g. walked off edge)
               isJumping = true; // Initiate a fall (gravity will take over next frame as playerVerticalVelocity is 0)
@@ -1220,14 +1443,14 @@ function handlePlayerMovement(deltaTime) {
 
     if (isPlayerDead) {
         renderer.render(scene, camera);
-        return; 
+        return;
     }
 
     const lifeArray = particleSystem.geometry.attributes.life.array;
-    const sizeArray = particleSystem.geometry.attributes.size.array; 
-    const colArray = particleSystem.geometry.attributes.color.array; 
+    const sizeArray = particleSystem.geometry.attributes.size.array;
+    const colArray = particleSystem.geometry.attributes.color.array;
     const echoDistanceArray = particleSystem.geometry.attributes.echoDistance.array; // NEW
-    
+
     const currentDynamicFadeDuration = isPowerUpActive ? POWERUP_ECHO_FADE_DURATION : ECHO_FADE_DURATION; // NEW
     const currentEffectiveRaycasterFar = isPowerUpActive ? POWERUP_RAYCASTER_FAR : NORMAL_RAYCASTER_FAR; // NEW for distanceRatio
 
@@ -1240,23 +1463,23 @@ function handlePlayerMovement(deltaTime) {
         if (lifeArray[i] > 0) {
             activeParticlesThisFrame++;
 
-            const dist = echoDistanceArray[i]; 
+            const dist = echoDistanceArray[i];
             const distanceRatio = Math.min(1.0, dist / currentEffectiveRaycasterFar);
-            const invertedDistanceRatio = 1.0 - distanceRatio; 
-            const decayMultiplier = 1.0 + (invertedDistanceRatio * DISTANCE_DECAY_RATE_MULTIPLIER); 
-            const effectiveDeltaTime = deltaTime * decayMultiplier; 
+            const invertedDistanceRatio = 1.0 - distanceRatio;
+            const decayMultiplier = 1.0 + (invertedDistanceRatio * DISTANCE_DECAY_RATE_MULTIPLIER);
+            const effectiveDeltaTime = deltaTime * decayMultiplier;
 
-            const previousLifeForFlag = lifeArray[i]; 
-            lifeArray[i] -= effectiveDeltaTime; 
-            lifeDataChanged = true; 
+            const previousLifeForFlag = lifeArray[i];
+            lifeArray[i] -= effectiveDeltaTime;
+            lifeDataChanged = true;
 
             const currentVertexAlpha = colArray[i * 4 + 3];
             const currentSize = sizeArray[i];
 
             if (lifeArray[i] <= 0) { // DEAD
                 if (currentVertexAlpha !== 0.0) {
-                    colArray[i * 4 + 3] = 0.0; 
-                    colorDataChanged = true; 
+                    colArray[i * 4 + 3] = 0.0;
+                    colorDataChanged = true;
                 }
                 if (currentSize !== 0.0) {
                     sizeArray[i] = 0.0;
@@ -1267,8 +1490,8 @@ function handlePlayerMovement(deltaTime) {
                 let rawProgress = lifeArray[i] / ECHO_FADE_DURATION;
                 let effectiveLifeForCurrentFade = rawProgress * currentDynamicFadeDuration;
                 const linearFadeOutProgress = Math.min(1.0, Math.max(0, effectiveLifeForCurrentFade / currentDynamicFadeDuration));
-                const easedFadeOutProgress = Math.sqrt(Math.max(0, linearFadeOutProgress)); 
-                
+                const easedFadeOutProgress = Math.sqrt(Math.max(0, linearFadeOutProgress));
+
                 if (currentVertexAlpha !== easedFadeOutProgress) {
                     colArray[i * 4 + 3] = easedFadeOutProgress;
                     colorDataChanged = true;
@@ -1281,7 +1504,7 @@ function handlePlayerMovement(deltaTime) {
 
             } else if (lifeArray[i] <= LIFESTAGE_HOLD_THRESHOLD) { // HOLD
                 if (currentVertexAlpha !== 1.0) {
-                    colArray[i * 4 + 3] = 1.0; 
+                    colArray[i * 4 + 3] = 1.0;
                     colorDataChanged = true;
                 }
                 if (currentSize !== PARTICLE_BASE_SIZE) {
@@ -1322,7 +1545,7 @@ function handlePlayerMovement(deltaTime) {
             // We might need to re-apply baseAlpha here if aftershock was the *only* thing keeping it visible.
             // For simplicity, if an aftershock ends, the base lifecycle takes over. Any lingering boost is removed.
             // This happens implicitly as the aftershock is no longer processed for these particles.
-            continue; 
+            continue;
         }
 
         const aftershockEffectElapsedTime = currentElapsedTime - aftershock.startTime;
@@ -1336,7 +1559,7 @@ function handlePlayerMovement(deltaTime) {
             // This requires baseAlpha to be calculated and potentially stored or re-calculated before this loop begins for this frame.
             // For now, let's assume colArray[pIdx*4+3] holds the baseAlpha before this aftershock loop begins for this frame.
             const particleBaseAlphaThisFrame = colArray[pIdx * 4 + 3];
-            
+
             let finalAlpha = Math.min(1.0, particleBaseAlphaThisFrame + currentAlphaBoost);
             // If the particle's original life is zero, aftershock shouldn't make it fully visible again
             if (lifeArray[pIdx] <= 0 && particleBaseAlphaThisFrame === 0.0) {
@@ -1369,7 +1592,36 @@ function animate() {
 function render() {
     const deltaTime = clock.getDelta();
     const xrFrame = isInVR ? renderer.xr.getFrame() : null; // Get XRFrame if in VR
-    
+
+    // Update shader time uniform for all yantra models
+    const currentTime = clock.elapsedTime;
+
+    // Update red power-up yantra model
+    if (powerUpYantraModel && powerUpYantraModel.visible) {
+        // Rotate the model around Y axis
+        powerUpYantraModel.rotation.y += YANTRA_ROTATION_SPEED * deltaTime;
+
+        // Update shader time uniform for all meshes
+        powerUpYantraModel.traverse((child) => {
+            if (child.isMesh && child.material && child.material.uniforms && child.material.uniforms.time) {
+                child.material.uniforms.time.value = currentTime;
+            }
+        });
+    }
+
+    // Update purple power-up yantra model
+    if (projectilePowerUpYantraModel && projectilePowerUpYantraModel.visible) {
+        // Rotate the model around Y axis
+        projectilePowerUpYantraModel.rotation.y += YANTRA_ROTATION_SPEED * deltaTime;
+
+        // Update shader time uniform for all meshes
+        projectilePowerUpYantraModel.traverse((child) => {
+            if (child.isMesh && child.material && child.material.uniforms && child.material.uniforms.time) {
+                child.material.uniforms.time.value = currentTime;
+            }
+        });
+    }
+
     // --- BEGIN VR Input Polling ---
     if (isInVR) {
         const session = renderer.xr.getSession();
@@ -1386,7 +1638,7 @@ function render() {
                     if (source.handedness === 'right') {
                         // --- Start Enhanced Debugging for Right Thumbstick Axes ---
                         if (source.gamepad.axes.length >= 3) { // Check if axes[2] exists before trying to log it
-                            // console.log(`Right Controller Gamepad Raw Axes: [${source.gamepad.axes.join(', ')}]`); 
+                            // console.log(`Right Controller Gamepad Raw Axes: [${source.gamepad.axes.join(', ')}]`);
                             // More detailed log if the X value seems to be what we expect for snap turning input
                             if(Math.abs(source.gamepad.axes[2]) > 0.1) { // Only log if there's some movement on expected axis
                                 console.log(`DEBUG VR Input Polling - Right Handed Controller:`);
@@ -1401,6 +1653,29 @@ function render() {
                         vrControllerInputs.right.thumbstickX = source.gamepad.axes[2] || 0;
                         vrControllerInputs.right.thumbstickY = source.gamepad.axes[3] || 0;
                         vrControllerInputs.right.thumbstickPressed = source.gamepad.buttons[3]?.pressed || false;
+
+                        // Check for button press for flying (using button index 4 as requested)
+                        // Button mapping for Oculus Quest controllers:
+                        // 0=A/X, 1=B/Y, 2=trigger, 3=grip, 4=thumbstick press, 5=menu, 6=?, 7=secondary trigger
+                        vrControllerInputs.right.flyButtonPressed = source.gamepad.buttons[4]?.pressed || false;
+
+                        // Debug button press for flying
+                        if (vrControllerInputs.right.flyButtonPressed) {
+                            console.log("Right controller thumbstick press - Flying activated");
+                        }
+
+                        // Log all button states for debugging if any button is pressed
+                        let anyButtonPressed = false;
+                        for (let i = 0; i < source.gamepad.buttons.length; i++) {
+                            if (source.gamepad.buttons[i]?.pressed) {
+                                anyButtonPressed = true;
+                                console.log(`Right controller button ${i} is pressed`);
+                            }
+                        }
+
+                        if (anyButtonPressed) {
+                            console.log(`Total buttons available: ${source.gamepad.buttons.length}`);
+                        }
                     }
                 }
             }
@@ -1409,11 +1684,11 @@ function render() {
     // --- END VR Input Polling ---
 
     // NEW: Clean up any lingering impact flashes
-    const currentTime = Date.now();
+    const currentTimeMs = Date.now();
     for (let i = activeImpactFlashes.length - 1; i >= 0; i--) {
         const flash = activeImpactFlashes[i];
-        const flashAge = currentTime - flash.creationTime;
-        
+        const flashAge = currentTimeMs - flash.creationTime;
+
         if (flashAge > MAX_FLASH_AGE) {
             if (flash.mesh.parent) {
                 scene.remove(flash.mesh);
@@ -1422,22 +1697,22 @@ function render() {
             activeImpactFlashes.splice(i, 1);
         }
     }
-    
+
     if (isPlayerDead) {
         renderer.render(scene, camera);
         return;
     }
-    
+
     // Process echo particles progressively
     processEchoParticles();
-    
+
     // Power-up Timer (Red power-up)
     if (isPowerUpActive) {
         powerUpRemainingTime -= deltaTime;
         if (powerUpRemainingTime <= 0) {
             isPowerUpActive = false;
             powerUpRemainingTime = 0;
-            if (powerUpSphereMesh) powerUpSphereMesh.visible = true; 
+            if (powerUpSphereMesh) powerUpSphereMesh.visible = true;
             console.log("Red Power-up expired.");
         }
     }
@@ -1497,6 +1772,34 @@ function render() {
         // VR movement using controllers
         handleVRMovement(deltaTime, xrFrame); // Pass xrFrame
 
+        // Apply continuous gravity when not flying
+        if (!isFlying && renderer.xr.isPresenting) {
+            const referenceSpace = renderer.xr.getReferenceSpace();
+            if (referenceSpace) {
+                // Get the camera to determine current height
+                const xrCamera = renderer.xr.getCamera();
+                const cameraPosition = new THREE.Vector3();
+                xrCamera.getWorldPosition(cameraPosition);
+
+                // Only apply gravity if above ground level
+                if (cameraPosition.y > playerHeight) {
+                    // Calculate gravity movement
+                    const gravityMovement = FLY_GRAVITY * deltaTime * 0.5; // Reduced for smoother fall
+
+                    // Create a transform that moves the player downward
+                    // Note: In WebXR transforms, positive Y in the transform moves downward
+                    const transform = new XRRigidTransform(
+                        {x: 0, y: Math.min(gravityMovement, cameraPosition.y - playerHeight), z: 0}, // Positive Y to move downward
+                        {x: 0, y: 0, z: 0, w: 1}
+                    );
+
+                    // Apply the transform to the reference space
+                    const newReferenceSpace = referenceSpace.getOffsetReferenceSpace(transform);
+                    renderer.xr.setReferenceSpace(newReferenceSpace);
+                }
+            }
+        }
+
         // VR Player enters opened puzzle door
         if (isPuzzleDoorOpen && puzzleDoorSpawnLocation && isPuzzleDoorActive) {
             const vrPlayerPosition = new THREE.Vector3();
@@ -1507,34 +1810,34 @@ function render() {
                 loadNewMaze();
             }
         }
-        
+
         // Update VR debug display if available
         if (vrDebugDisplay && renderer.xr.getSession()) {
             const session = renderer.xr.getSession();
             const inputSources = Array.from(session.inputSources);
-            
+
             // Get gamepad data from controllers
             const leftController = inputSources.find(source => source.handedness === 'left' && source.gamepad);
             const rightController = inputSources.find(source => source.handedness === 'right' && source.gamepad);
-            
+
             const leftAxes = leftController?.gamepad?.axes;
             const rightAxes = rightController?.gamepad?.axes;
-            
+
             // Update the debug display
             vrDebugDisplay.update(leftAxes, rightAxes);
         }
-        
+
         // Update VR mini-map if available
         if (vrMiniMapTexture) {
             updateVRMiniMap();
         }
-        
+
 
         // Check for power-up collisions in VR
         // Get actual camera/headset position in world space
         const vrCameraPosition = new THREE.Vector3();
         camera.getWorldPosition(vrCameraPosition);
-        
+
         // Collision detection with power-ups in VR
         if (powerUpSphereMesh && powerUpSphereMesh.visible) {
             const distance = vrCameraPosition.distanceTo(powerUpSphereMesh.position);
@@ -1551,7 +1854,7 @@ function render() {
                 }
             }
         }
-        
+
         if (projectilePowerUpSphereMesh && projectilePowerUpSphereMesh.visible) {
             const distance = vrCameraPosition.distanceTo(projectilePowerUpSphereMesh.position);
             if (distance < 1.0) {  // Reasonable collision radius
@@ -1559,7 +1862,7 @@ function render() {
                 projectilePowerUpRemainingTime = PROJECTILE_POWERUP_DURATION;
                 projectilePowerUpSphereMesh.visible = false;
                 console.log("Projectile Power-up activated in VR!");
-                scheduleBeatSoundStart(); 
+                scheduleBeatSoundStart();
                 if (pickupSoundBuffer && audioContext) {
                     const source = audioContext.createBufferSource();
                     source.buffer = pickupSoundBuffer;
@@ -1595,30 +1898,58 @@ function render() {
         }
         // END NEW Player enters door
     }
-    
+
     // Projectile Animation and Collision Logic
     if (isProjectileInFlight) {
         let activeProjectiles = 0;
-        
+
         // Process each projectile
         for (let i = 0; i < tossedProjectileMeshes.length; i++) {
             // Skip if this projectile is already dead
             if (projectileCurrentLives[i] <= 0) continue;
-            
+
             // We have at least one active projectile
             activeProjectiles++;
-            
+
             // Update lifetime
             projectileCurrentLives[i] -= deltaTime;
-            
+
             // Apply gravity and move
             tossedProjectileVelocities[i].y -= GRAVITY * deltaTime * 0.5;
             tossedProjectileMeshes[i].position.addScaledVector(tossedProjectileVelocities[i], deltaTime);
-            
+
+            // Update shader time uniform for animation
+            if (tossedProjectileMeshes[i].material &&
+                tossedProjectileMeshes[i].material.uniforms &&
+                tossedProjectileMeshes[i].material.uniforms.time) {
+                tossedProjectileMeshes[i].material.uniforms.time.value = currentTime;
+            }
+
+            // Update trail positions
+            if (projectileTrails[i]) {
+                // Store previous positions for trail effect
+                const trailSegments = projectileTrails[i];
+
+                // Update trail segment positions
+                for (let j = trailSegments.length - 1; j > 0; j--) {
+                    // Move each segment to the position of the segment in front of it
+                    if (trailSegments[j-1].visible) {
+                        trailSegments[j].position.copy(trailSegments[j-1].position);
+                        trailSegments[j].visible = true;
+                    }
+                }
+
+                // Update the first trail segment to the current projectile position
+                if (trailSegments[0]) {
+                    trailSegments[0].position.copy(tossedProjectileMeshes[i].position);
+                    trailSegments[0].visible = true;
+                }
+            }
+
             // Check for collisions
             const projectileAABB = new THREE.Box3().setFromObject(tossedProjectileMeshes[i]);
-            let projectileActuallyHitSomething = false; 
-            
+            let projectileActuallyHitSomething = false;
+
             for (const obj of echoableObjects) {
                 if (!obj.visible || obj.userData.isPowerUp || obj.userData.isProjectilePowerUp) {
                     continue;
@@ -1629,7 +1960,7 @@ function render() {
                 // Priority 1: Active Puzzle Door Targets
                 if (obj.userData.isDoorTarget && isPuzzleDoorActive && !isPuzzleDoorOpen) {
                     // Ensure the object's world matrix is up to date for accurate AABB calculation.
-                    obj.updateMatrixWorld(true); 
+                    obj.updateMatrixWorld(true);
                     const targetWorldAABB = new THREE.Box3().setFromObject(obj); // Recalculate AABB in world space on the fly
 
                     if (targetWorldAABB && projectileAABB.intersectsBox(targetWorldAABB)) { // Use the freshly calculated world AABB
@@ -1657,7 +1988,16 @@ function render() {
                                 source.start(0);
                             }
                             const impactPosition = tossedProjectileMeshes[i].position.clone();
+                            // Remove projectile
                             scene.remove(tossedProjectileMeshes[i]);
+
+                            // Remove trail segments
+                            if (projectileTrails[i]) {
+                                for (const segment of projectileTrails[i]) {
+                                    scene.remove(segment);
+                                }
+                            }
+
                             triggerEcho(impactPosition, PROJECTILE_ECHO_PARTICLE_COLOR);
                             projectileCurrentLives[i] = 0;
                             projectileActuallyHitSomething = true;
@@ -1665,7 +2005,7 @@ function render() {
                         }
                     }
                 }
-                
+
                 // Priority 2: Generic Objects (if no target was hit in this iteration)
                 // Also, skip the main door panel if the puzzle is active and the door isn't open yet.
                 if (!hitRegisteredInThisLoopIteration) {
@@ -1678,16 +2018,25 @@ function render() {
                         // Generic collision with any other object,
                         // OR collision with the puzzleDoorMesh when it's not being skipped (e.g., puzzle inactive or door open).
                         console.log("Projectile collided with a generic object (or inactive/open door panel)!");
-                        
+
                         const impactPosition = tossedProjectileMeshes[i].position.clone();
+
+                        // Remove projectile
                         scene.remove(tossedProjectileMeshes[i]);
-                        
+
+                        // Remove trail segments
+                        if (projectileTrails[i]) {
+                            for (const segment of projectileTrails[i]) {
+                                scene.remove(segment);
+                            }
+                        }
+
                         const echoOrigin = impactPosition.clone();
-                        echoOrigin.y += 0.1; 
-                        
+                        echoOrigin.y += 0.1;
+
                         console.log("Creating impact flash for generic collision");
                         const impactFlash = new THREE.Mesh(
-                            new THREE.SphereGeometry(1.0, 8, 8), 
+                            new THREE.SphereGeometry(1.0, 8, 8),
                             new THREE.MeshBasicMaterial({
                                 color: PROJECTILE_ECHO_PARTICLE_COLOR,
                                 transparent: true,
@@ -1696,19 +2045,19 @@ function render() {
                         );
                         impactFlash.position.copy(echoOrigin);
                         scene.add(impactFlash);
-                        
+
                         activeImpactFlashes.push({
                             mesh: impactFlash,
                             creationTime: Date.now()
                         });
-                        
+
                         setTimeout(() => {
                             if (impactFlash.parent) {
                                 scene.remove(impactFlash);
                                 // console.log("Generic impact flash removed by timeout");
                             }
-                        }, 100); 
-                        
+                        }, 100);
+
                         triggerEcho(echoOrigin, PROJECTILE_ECHO_PARTICLE_COLOR);
                         projectileCurrentLives[i] = 0;
                         projectileActuallyHitSomething = true;
@@ -1720,13 +2069,20 @@ function render() {
                     break; // Projectile hit something, break from 'for (const obj of echoableObjects)'
                 }
             } // End for (obj of echoableObjects)
-            
+
             // Handle projectile expiration if it didn't hit anything
             if (!projectileActuallyHitSomething && projectileCurrentLives[i] <= 0) {
                 console.log("Projectile lifespan expired.");
                 // Ensure mesh is still in scene before trying to remove
                 if (tossedProjectileMeshes[i] && tossedProjectileMeshes[i].parent) {
                     scene.remove(tossedProjectileMeshes[i]);
+                }
+
+                // Remove trail segments
+                if (projectileTrails[i]) {
+                    for (const segment of projectileTrails[i]) {
+                        scene.remove(segment);
+                    }
                 }
             }
         } // End for (i < tossedProjectileMeshes.length)
@@ -1765,15 +2121,15 @@ function render() {
     }
     // END NEW Puzzle Door Open Logic
 
-    // Particle animation logic 
+    // Particle animation logic
     const lifeArray = particleSystem.geometry.attributes.life.array;
-    const sizeArray = particleSystem.geometry.attributes.size.array; 
-    const colArray = particleSystem.geometry.attributes.color.array; 
-    const echoDistanceArray = particleSystem.geometry.attributes.echoDistance.array; 
-    
+    const sizeArray = particleSystem.geometry.attributes.size.array;
+    const colArray = particleSystem.geometry.attributes.color.array;
+    const echoDistanceArray = particleSystem.geometry.attributes.echoDistance.array;
+
     // Select the appropriate fade duration based on echo type
-    const currentDynamicFadeDuration = isPowerUpActive ? POWERUP_ECHO_FADE_DURATION : ECHO_FADE_DURATION; 
-    const currentEffectiveRaycasterFar = isPowerUpActive ? POWERUP_RAYCASTER_FAR : NORMAL_RAYCASTER_FAR; 
+    const currentDynamicFadeDuration = isPowerUpActive ? POWERUP_ECHO_FADE_DURATION : ECHO_FADE_DURATION;
+    const currentEffectiveRaycasterFar = isPowerUpActive ? POWERUP_RAYCASTER_FAR : NORMAL_RAYCASTER_FAR;
 
     let activeParticlesThisFrame = 0;
     let lifeDataChanged = false;
@@ -1789,27 +2145,27 @@ function render() {
             activeParticlesThisFrame++; // Count active particles for main lifecycle processing
 
             // Check if this is a purple projectile particle
-            const isPurpleParticle = colArray[i * 4 + 0] === PROJECTILE_ECHO_PARTICLE_COLOR.r && 
-                                     colArray[i * 4 + 1] === PROJECTILE_ECHO_PARTICLE_COLOR.g && 
+            const isPurpleParticle = colArray[i * 4 + 0] === PROJECTILE_ECHO_PARTICLE_COLOR.r &&
+                                     colArray[i * 4 + 1] === PROJECTILE_ECHO_PARTICLE_COLOR.g &&
                                      colArray[i * 4 + 2] === PROJECTILE_ECHO_PARTICLE_COLOR.b;
-            
+
             // Apply slower decay rate for purple particles
-            const dist = echoDistanceArray[i]; 
+            const dist = echoDistanceArray[i];
             const distanceRatio = Math.min(1.0, dist / currentEffectiveRaycasterFar);
-            const invertedDistanceRatio = 1.0 - distanceRatio; 
-            
+            const invertedDistanceRatio = 1.0 - distanceRatio;
+
             // Reduce decay rate for purple particles so they stay visible longer
             const decayMultiplier = isPurpleParticle
-                ? 1.0 + (invertedDistanceRatio * DISTANCE_DECAY_RATE_MULTIPLIER * 0.7) // 30% slower decay for purple 
+                ? 1.0 + (invertedDistanceRatio * DISTANCE_DECAY_RATE_MULTIPLIER * 0.7) // 30% slower decay for purple
                 : 1.0 + (invertedDistanceRatio * DISTANCE_DECAY_RATE_MULTIPLIER);
-                
-            const effectiveDeltaTime = deltaTime * decayMultiplier; 
+
+            const effectiveDeltaTime = deltaTime * decayMultiplier;
 
             // Update life
-            const previousLifeForFlag = lifeArray[i]; 
-            lifeArray[i] -= effectiveDeltaTime; 
+            const previousLifeForFlag = lifeArray[i];
+            lifeArray[i] -= effectiveDeltaTime;
             if (lifeArray[i] !== previousLifeForFlag) lifeDataChanged = true;
-            
+
             // Determine baseAlpha and baseSize based on current life
             if (lifeArray[i] <= 0) { // DEAD
                 baseAlpha = 0.0;
@@ -1818,8 +2174,8 @@ function render() {
                 let rawProgress = lifeArray[i] / ECHO_FADE_DURATION;
                 let effectiveLifeForCurrentFade = rawProgress * currentDynamicFadeDuration;
                 const linearFadeOutProgress = Math.min(1.0, Math.max(0, effectiveLifeForCurrentFade / currentDynamicFadeDuration));
-                const easedFadeOutProgress = Math.sqrt(Math.max(0, linearFadeOutProgress)); 
-                
+                const easedFadeOutProgress = Math.sqrt(Math.max(0, linearFadeOutProgress));
+
                 // Higher minimum alpha for purple particles during fade out
                 if (isPurpleParticle) {
                     baseAlpha = Math.max(0.1, easedFadeOutProgress);
@@ -1874,21 +2230,21 @@ function render() {
         if (sizeDataChanged) particleSystem.geometry.attributes.size.needsUpdate = true;
         if (colorDataChanged) particleSystem.geometry.attributes.color.needsUpdate = true;
     }
-    
+
     // Update mini-map only in non-VR mode
     if (!isInVR) {
         renderMiniMap();
     }
-    
+
     renderer.render(scene, camera);
 }
 
 // Start everything
-init(); 
+init();
 
 // Helper function to create a wall segment
 function createWall(x, z, length, orientation, customThickness = WALL_THICKNESS, customHeight = WALL_HEIGHT) {
-    const wallMaterial = new THREE.MeshStandardMaterial({ 
+    const wallMaterial = new THREE.MeshStandardMaterial({
         color: 0x222222, // Dark grey for walls
         roughness: 0.8,
         metalness: 0.1
@@ -1907,7 +2263,7 @@ function createWall(x, z, length, orientation, customThickness = WALL_THICKNESS,
     // Calculate AABB for collision
     const halfSizeX = (orientation === 'horizontal') ? length / 2 : customThickness / 2;
     const halfSizeZ = (orientation === 'vertical') ? length / 2 : customThickness / 2;
-    
+
     wall.userData.aabb = new THREE.Box3(
         new THREE.Vector3(x - halfSizeX, 0, z - halfSizeZ), // Min Y is 0 (floor)
         new THREE.Vector3(x + halfSizeX, customHeight, z + halfSizeZ) // Max Y is wallHeight
@@ -1921,7 +2277,7 @@ function createWall(x, z, length, orientation, customThickness = WALL_THICKNESS,
 
 function buildMaze() {
     console.log("Building procedural maze...");
-    
+
     // Clear any existing walls
     for (let wall of walls) {
         scene.remove(wall);
@@ -1932,63 +2288,63 @@ function buildMaze() {
     }
     // Clear the array instead of reassigning it
     walls.length = 0;
-    
+
     // Maze parameters
     const mazeSize = 9; // Smaller maze with clearer structure
     const cellSize = 6; // Larger cells for better visibility
     const wallThickness = 1.0; // Thicker walls for better visibility on minimap
-    
+
     // Maze grid: 0 = wall, 1 = path
     const maze = generateMaze(mazeSize);
-    
+
     // Center of the maze in world coordinates
     const mazeOffsetX = -((mazeSize * cellSize) / 2);
     const mazeOffsetZ = -((mazeSize * cellSize) / 2);
-    
+
     // Build the maze walls based on grid
     for (let x = 0; x < mazeSize; x++) {
         for (let z = 0; z < mazeSize; z++) {
             if (maze[x][z] === 0) { // This is a wall cell
                 const worldX = mazeOffsetX + x * cellSize + cellSize / 2;
                 const worldZ = mazeOffsetZ + z * cellSize + cellSize / 2;
-                
+
                 // Create a wall block at this position
                 const wall = new THREE.Mesh(
                     new THREE.BoxGeometry(cellSize, WALL_HEIGHT, cellSize),
-                    new THREE.MeshStandardMaterial({ 
+                    new THREE.MeshStandardMaterial({
                         color: 0x222222, // Dark grey for walls
                         roughness: 0.8,
                         metalness: 0.1
                     })
                 );
                 wall.position.set(worldX, WALL_HEIGHT / 2, worldZ);
-                
+
                 // Calculate AABB for collision
                 wall.userData.aabb = new THREE.Box3(
                     new THREE.Vector3(worldX - cellSize/2, 0, worldZ - cellSize/2),
                     new THREE.Vector3(worldX + cellSize/2, WALL_HEIGHT, worldZ + cellSize/2)
                 );
-                
+
                 walls.push(wall);
                 scene.add(wall);
                 echoableObjects.push(wall);
             }
         }
     }
-    
+
     // Find a path cell for the player to start (using the first path cell)
     let startX, startZ;
     let pathCells = []; // Track all path cells for power-up placement
-    
+
     for (let x = 0; x < mazeSize; x++) {
         for (let z = 0; z < mazeSize; z++) {
             if (maze[x][z] === 1) {
                 const worldX = mazeOffsetX + x * cellSize + cellSize / 2;
                 const worldZ = mazeOffsetZ + z * cellSize + cellSize / 2;
-                
+
                 // Store all path cells for later use
                 pathCells.push({x: worldX, z: worldZ, gridX: x, gridZ: z});
-                
+
                 // Set the start position to the first path cell found
                 if (!startX && !startZ) {
                     startX = worldX;
@@ -1997,12 +2353,12 @@ function buildMaze() {
             }
         }
     }
-    
+
     // Function to check if a cell is far enough from walls
     const isValidPickupLocation = (cell, maze, mazeSize) => {
         const x = cell.gridX;
         const z = cell.gridZ;
-        
+
         // Only check the four immediate adjacent cells (no diagonals)
         // This is less strict than checking all 8 surrounding cells
         const adjacentOffsets = [
@@ -2011,31 +2367,31 @@ function buildMaze() {
             [0, 1],  // South
             [-1, 0]  // West
         ];
-        
+
         // Check if any adjacent cells are walls
         for (const [dx, dz] of adjacentOffsets) {
             const nx = x + dx;
             const nz = z + dz;
-            
+
             // Skip if out of bounds
             if (nx < 0 || nx >= mazeSize || nz < 0 || nz >= mazeSize) continue;
-            
+
             // If adjacent cell is a wall, this location is not valid
             if (maze[nx][nz] === 0) return false;
         }
-        
+
         return true;
     };
-    
+
     // Filter out cells that are too close to walls
     // const validPathCells = pathCells.filter(cell => isValidPickupLocation(cell, maze, mazeSize)); // OLD STRICT FILTER
 
     // NEW: Temporarily make all pathCells valid to ensure door placement
-    const validPathCells = [...pathCells]; 
-    
+    const validPathCells = [...pathCells];
+
     // Store globally for debugging
     window._debugPathCells = validPathCells;
-    
+
     console.log(`Path cells found: ${pathCells.length}, Valid path cells after filtering: ${validPathCells.length}`);
     if (validPathCells.length === 0 && pathCells.length > 0) {
         console.warn("No valid path cells found after filtering! Maze might be too small or compact.");
@@ -2044,7 +2400,7 @@ function buildMaze() {
             console.log(`Sample path cell ${i}:`, cell);
         });
     }
-    
+
     // Place power-ups if we have valid cells
     if (validPathCells.length > 5) {
         console.log("Found", validPathCells.length, "valid path cells for power-up placement");
@@ -2054,161 +2410,185 @@ function buildMaze() {
             const distB = Math.sqrt(Math.pow(b.x - startX, 2) + Math.pow(b.z - startZ, 2));
             return distB - distA; // Descending order to get farthest first
         });
-        
+
         // Ensure we only pick locations that are far enough apart from each other
         const MIN_DISTANCE_BETWEEN_PICKUPS = cellSize * 1.5; // REDUCED: Only 1.5 cells apart instead of 3
         const selectedCells = [];
-        
+
         // Get the first valid cell for red power-up
         selectedCells.push(validPathCells[0]);
-        
+
         // Find a cell for the purple power-up that's far enough from the red one
         let purplePickupCell = null;
         for (let i = 1; i < validPathCells.length; i++) {
             let isFarEnough = true;
-            
+
             // Check distance to all previously selected cells
             for (const selected of selectedCells) {
                 const distance = Math.sqrt(
-                    Math.pow(validPathCells[i].x - selected.x, 2) + 
+                    Math.pow(validPathCells[i].x - selected.x, 2) +
                     Math.pow(validPathCells[i].z - selected.z, 2)
                 );
-                
+
                 if (distance < MIN_DISTANCE_BETWEEN_PICKUPS) {
                     isFarEnough = false;
                     break;
                 }
             }
-            
+
             if (isFarEnough) {
                 purplePickupCell = validPathCells[i];
                 selectedCells.push(purplePickupCell);
                 break;
             }
         }
-        
+
         // If we couldn't find a far enough cell, pick the farthest available
         if (!purplePickupCell && validPathCells.length > 1) {
             console.log("Couldn't find a far enough cell for purple pickup, using next available");
             purplePickupCell = validPathCells[1];
             selectedCells.push(purplePickupCell);
         }
-        
+
         // Place red power-up
         if (powerUpSphereMesh && selectedCells.length > 0) {
             const redCell = selectedCells[0];
             powerUpSphereMesh.position.set(
-                redCell.x, 
-                playerHeight, 
+                redCell.x,
+                playerHeight,
                 redCell.z
             );
             powerUpSphereMesh.userData.aabb.setFromObject(powerUpSphereMesh);
             powerUpSphereMesh.visible = true;
+
+            // Reset rotation of red power-up yantra model
+            if (powerUpYantraModel) {
+                powerUpYantraModel.rotation.set(0, 0, 0);
+            }
+
             console.log("Red power-up placed at:", redCell, "Position:", powerUpSphereMesh.position);
         } else {
-            console.warn("Could not place red power-up:", 
-                        powerUpSphereMesh ? "sphere exists" : "sphere missing", 
+            console.warn("Could not place red power-up:",
+                        powerUpSphereMesh ? "sphere exists" : "sphere missing",
                         selectedCells.length > 0 ? "cells available" : "no cells available");
         }
-        
+
         // Place projectile power-up
         if (projectilePowerUpSphereMesh && selectedCells.length > 1) {
             const purpleCell = selectedCells[1];
             projectilePowerUpSphereMesh.position.set(
-                purpleCell.x, 
-                playerHeight, 
+                purpleCell.x,
+                playerHeight,
                 purpleCell.z
             );
             projectilePowerUpSphereMesh.userData.aabb.setFromObject(projectilePowerUpSphereMesh);
             projectilePowerUpSphereMesh.visible = true;
+
+            // Reset rotation of purple power-up yantra model
+            if (projectilePowerUpYantraModel) {
+                projectilePowerUpYantraModel.rotation.set(0, 0, 0);
+            }
+
             console.log("Projectile power-up placed at:", purpleCell, "Position:", projectilePowerUpSphereMesh.position);
         } else {
-            console.warn("Could not place purple power-up:", 
-                        projectilePowerUpSphereMesh ? "sphere exists" : "sphere missing", 
+            console.warn("Could not place purple power-up:",
+                        projectilePowerUpSphereMesh ? "sphere exists" : "sphere missing",
                         selectedCells.length > 1 ? "cells available" : "not enough cells available");
         }
     } else {
         console.warn("Not enough valid path cells for power-up placement. Using fallback positioning.");
-        
+
         // IMPROVED FALLBACK: Better distribute power-ups when limited valid cells
         // Use the available cells but shuffle them first to add randomness
         const cellsToUse = pathCells.length > 1 ? [...pathCells] : [{x: startX, z: startZ}];
-        
+
         // Basic array shuffle (Fisher-Yates algorithm)
         for (let i = cellsToUse.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));
             [cellsToUse[i], cellsToUse[j]] = [cellsToUse[j], cellsToUse[i]];
         }
-        
+
         // Place red power-up in a random location that's different from player start if possible
         let redIndex = 0;
         // If more than one cell and the first happens to be player start, use different cell
-        if (cellsToUse.length > 1 && 
-            Math.abs(cellsToUse[0].x - startX) < 0.1 && 
+        if (cellsToUse.length > 1 &&
+            Math.abs(cellsToUse[0].x - startX) < 0.1 &&
             Math.abs(cellsToUse[0].z - startZ) < 0.1) {
             redIndex = 1;
         }
-        
+
         // Place purple power-up in a different location if possible
         let purpleIndex = redIndex + 1;
         if (purpleIndex >= cellsToUse.length) purpleIndex = (redIndex === 0) ? 0 : 0;
-        
+
         // Handle the single cell edge case
         const useOffset = cellsToUse.length === 1;
-        
+
         // Place red powerup
         if (powerUpSphereMesh) {
             powerUpSphereMesh.position.set(
-                cellsToUse[redIndex].x + (useOffset ? -1.5 : 0), 
-                playerHeight, 
+                cellsToUse[redIndex].x + (useOffset ? -1.5 : 0),
+                playerHeight,
                 cellsToUse[redIndex].z + (useOffset ? 1.5 : 0)
             );
             powerUpSphereMesh.userData.aabb.setFromObject(powerUpSphereMesh);
             powerUpSphereMesh.visible = true;
-            console.log("Red power-up placed at (fallback):", 
-                      useOffset ? "offset from" : "", cellsToUse[redIndex], 
+
+            // Reset rotation of red power-up yantra model
+            if (powerUpYantraModel) {
+                powerUpYantraModel.rotation.set(0, 0, 0);
+            }
+
+            console.log("Red power-up placed at (fallback):",
+                      useOffset ? "offset from" : "", cellsToUse[redIndex],
                       "Position:", powerUpSphereMesh.position);
         }
-        
+
         // Place purple powerup
         if (projectilePowerUpSphereMesh) {
             projectilePowerUpSphereMesh.position.set(
-                cellsToUse[purpleIndex].x + (useOffset ? 1.5 : 0), 
-                playerHeight, 
+                cellsToUse[purpleIndex].x + (useOffset ? 1.5 : 0),
+                playerHeight,
                 cellsToUse[purpleIndex].z + (useOffset ? -1.5 : 0)
             );
             projectilePowerUpSphereMesh.userData.aabb.setFromObject(projectilePowerUpSphereMesh);
             projectilePowerUpSphereMesh.visible = true;
-            console.log("Purple power-up placed at (fallback):", 
-                      useOffset ? "offset from" : "", cellsToUse[purpleIndex], 
+
+            // Reset rotation of purple power-up yantra model
+            if (projectilePowerUpYantraModel) {
+                projectilePowerUpYantraModel.rotation.set(0, 0, 0);
+            }
+
+            console.log("Purple power-up placed at (fallback):",
+                      useOffset ? "offset from" : "", cellsToUse[purpleIndex],
                       "Position:", projectilePowerUpSphereMesh.position);
         }
     }
-    
+
     // Set player starting position within the maze - MODIFIED TO PREVENT SPAWNING ON POWER-UPS
     PLAYER_START_X = startX;
     PLAYER_START_Z = startZ;
-    
+
     // Check if player would spawn on red power-up
-    if (powerUpSphereMesh && Math.abs(PLAYER_START_X - powerUpSphereMesh.position.x) < 1 && 
+    if (powerUpSphereMesh && Math.abs(PLAYER_START_X - powerUpSphereMesh.position.x) < 1 &&
         Math.abs(PLAYER_START_Z - powerUpSphereMesh.position.z) < 1) {
         // Add offset to prevent spawning on power-up
         PLAYER_START_X += 2;
         PLAYER_START_Z += 2;
         console.log("Adjusted player start position to avoid spawning on red power-up");
     }
-    
+
     // Check if player would spawn on purple power-up
-    if (projectilePowerUpSphereMesh && Math.abs(PLAYER_START_X - projectilePowerUpSphereMesh.position.x) < 1 && 
+    if (projectilePowerUpSphereMesh && Math.abs(PLAYER_START_X - projectilePowerUpSphereMesh.position.x) < 1 &&
         Math.abs(PLAYER_START_Z - projectilePowerUpSphereMesh.position.z) < 1) {
         // Add offset to prevent spawning on power-up
         PLAYER_START_X += 2;
         PLAYER_START_Z -= 2;
         console.log("Adjusted player start position to avoid spawning on purple power-up");
     }
-    
+
     camera.position.set(PLAYER_START_X, playerHeight, PLAYER_START_Z);
-    
+
     console.log(`Maze built with ${walls.length} wall segments. Player starting at (${PLAYER_START_X}, ${PLAYER_START_Z}).`);
 
     // NEW: Determine puzzle door spawn location
@@ -2247,7 +2627,7 @@ function buildMaze() {
                 // For now, door position is on the shared edge.
                 let doorPosX = worldPathX + n.dx * (cellSize / 2);
                 let doorPosZ = worldPathZ + n.dz * (cellSize / 2);
-                
+
                 // The door's main panel has thickness DOOR_THICKNESS/2.
                 // To place it on the surface, we might need to adjust slightly by its normal if its origin is its center.
                 // The createPuzzleDoor places the mesh at `position` and its depth is DOOR_THICKNESS/2
@@ -2277,7 +2657,7 @@ function buildMaze() {
         if (suitableCandidates.length === 0 && candidateDoorLocations.length > 0) {
             console.warn("All candidate door locations were too close to powerups. Using original list for random selection, but still preferring farther spots.");
             // Fallback: use all candidates, but they will still be sorted by distance later.
-            suitableCandidates = [...candidateDoorLocations]; 
+            suitableCandidates = [...candidateDoorLocations];
         }
 
         if (suitableCandidates.length > 0) {
@@ -2292,18 +2672,18 @@ function buildMaze() {
             // Pick a RANDOM candidate from the suitable (and sorted) list
             const randomIndex = Math.floor(Math.random() * suitableCandidates.length);
             const chosenDoorCandidate = suitableCandidates[randomIndex];
-            
+
             puzzleDoorSpawnLocation = chosenDoorCandidate.position.clone();
             puzzleDoorSpawnNormal = chosenDoorCandidate.normal.clone(); // Set the facing normal
 
             // Determine a general orientation string for logging or other simple logic if needed
             if (Math.abs(chosenDoorCandidate.normal.x) > Math.abs(chosenDoorCandidate.normal.z)) {
-                 puzzleDoorSpawnOrientation = 'vertical'; 
+                 puzzleDoorSpawnOrientation = 'vertical';
             } else {
-                 puzzleDoorSpawnOrientation = 'horizontal'; 
+                 puzzleDoorSpawnOrientation = 'horizontal';
             }
             console.log("New puzzle door spawn location (randomly selected from suitable) SET:", puzzleDoorSpawnLocation, "Facing Normal:", puzzleDoorSpawnNormal, "Implied Orientation:", puzzleDoorSpawnOrientation);
-            // console.log("Chosen door candidate details:", chosenDoorCandidate); 
+            // console.log("Chosen door candidate details:", chosenDoorCandidate);
 
         } else {
             // This case implies candidateDoorLocations was empty to begin with.
@@ -2330,10 +2710,10 @@ function createPuzzleDoor(position, facingNormal) { // Changed signature: target
 
     // Door Panel
     const doorPanelGeometry = new THREE.BoxGeometry(DOOR_WIDTH, DOOR_HEIGHT, DOOR_THICKNESS / 2); // Thinner panel
-    const doorPanelMaterial = new THREE.MeshStandardMaterial({ 
+    const doorPanelMaterial = new THREE.MeshStandardMaterial({
         color: PUZZLE_DOOR_BASE_COLOR, // Use base color for the main color
-        roughness: 0.8, 
-        metalness: 0.1, 
+        roughness: 0.8,
+        metalness: 0.1,
         emissive: PUZZLE_DOOR_EMISSIVE_PANEL_COLOR, // Emissive color for glow
         emissiveIntensity: PUZZLE_DOOR_EMISSIVE_INTENSITY,
         side: THREE.DoubleSide // Ensure both sides are rendered
@@ -2346,10 +2726,10 @@ function createPuzzleDoor(position, facingNormal) { // Changed signature: target
     const frameThickness = DOOR_THICKNESS;
     const frameSideGeometry = new THREE.BoxGeometry(frameThickness, DOOR_HEIGHT, frameThickness);
     const frameTopGeometry = new THREE.BoxGeometry(DOOR_WIDTH + 2 * frameThickness, frameThickness, frameThickness);
-    const frameMaterial = new THREE.MeshStandardMaterial({ 
+    const frameMaterial = new THREE.MeshStandardMaterial({
         color: PUZZLE_DOOR_BASE_COLOR, // Use base color for the main color
-        roughness: 0.7, 
-        metalness: 0.1, 
+        roughness: 0.7,
+        metalness: 0.1,
         emissive: PUZZLE_DOOR_EMISSIVE_FRAME_COLOR, // Emissive color for glow
         emissiveIntensity: PUZZLE_DOOR_EMISSIVE_INTENSITY,
         side: THREE.DoubleSide // Ensure both sides are rendered
@@ -2388,7 +2768,7 @@ function createPuzzleDoor(position, facingNormal) { // Changed signature: target
     puzzleDoorTarget2Mesh.userData.aabb = new THREE.Box3().setFromObject(puzzleDoorTarget2Mesh);
 
     // --- NEW ORIENTATION LOGIC ---
-    // The door panel geometry is created such that its "face" (where targets are placed, local +Z of the panel) 
+    // The door panel geometry is created such that its "face" (where targets are placed, local +Z of the panel)
     // should point towards the targetToFace (player).
     // The puzzleDoorMesh itself is positioned at `position`.
     // We make the door look at the player's XZ position, maintaining its own Y position for the lookAt target.
@@ -2426,7 +2806,7 @@ function createPuzzleDoor(position, facingNormal) { // Changed signature: target
     scene.add(puzzleDoorMesh);
     // Important: Add targets to echoableObjects AFTER they are parented to puzzleDoorMesh and puzzleDoorMesh is positioned and oriented,
     // so their world matrices and AABBs are correct if calculated immediately.
-    echoableObjects.push(puzzleDoorMesh, puzzleDoorTarget1Mesh, puzzleDoorTarget2Mesh); 
+    echoableObjects.push(puzzleDoorMesh, puzzleDoorTarget1Mesh, puzzleDoorTarget2Mesh);
 
     // Update AABBs for targets in world space *after* parent transformations are applied.
     // This is crucial if AABBs are calculated once and stored.
@@ -2477,22 +2857,33 @@ function loadNewMaze() {
     powerUpRemainingTime = 0;
     if (powerUpSphereMesh) powerUpSphereMesh.visible = true; // Make it reappear
 
+    // Reset rotation of red power-up yantra model
+    if (powerUpYantraModel) {
+        powerUpYantraModel.rotation.set(0, 0, 0);
+    }
+
     isProjectileEchoPowerUpActive = false;
     projectilePowerUpRemainingTime = 0;
     if (projectilePowerUpSphereMesh) projectilePowerUpSphereMesh.visible = true; // Make it reappear
+
+    // Reset rotation of purple power-up yantra model
+    if (projectilePowerUpYantraModel) {
+        projectilePowerUpYantraModel.rotation.set(0, 0, 0);
+    }
+
     stopBeatSound(); // Ensure beat sound is stopped
 
     // 4. Reset and Remove Current Door (if it exists and wasn't cleaned up)
     if (isPuzzleDoorActive || puzzleDoorMesh) {
         if (puzzleDoorMesh && puzzleDoorMesh.parent) scene.remove(puzzleDoorMesh);
-        
+
         // Remove from echoableObjects carefully
         const doorIdx = echoableObjects.indexOf(puzzleDoorMesh);
         if (doorIdx > -1) echoableObjects.splice(doorIdx, 1);
         const target1Idx = echoableObjects.indexOf(puzzleDoorTarget1Mesh);
         if (target1Idx > -1) echoableObjects.splice(target1Idx, 1);
         const target2Idx = echoableObjects.indexOf(puzzleDoorTarget2Mesh);
-        if (target2Idx > -1) echoableObjects.splice(target2Index, 1);
+        if (target2Idx > -1) echoableObjects.splice(target2Idx, 1);
 
         puzzleDoorMesh = null;
         puzzleDoorTarget1Mesh = null;
@@ -2529,10 +2920,22 @@ function loadNewMaze() {
     if (particleSystem) {
        // Optionally reset all particles to inactive/offscreen if visual artifacts occur during transition
     }
-    tossedProjectileMeshes.forEach(p => scene.remove(p));
+    // Clean up projectiles and their trails
+    for (let i = 0; i < tossedProjectileMeshes.length; i++) {
+        scene.remove(tossedProjectileMeshes[i]);
+
+        // Clean up trail segments
+        if (projectileTrails[i]) {
+            for (const segment of projectileTrails[i]) {
+                scene.remove(segment);
+            }
+        }
+    }
+
     tossedProjectileMeshes.length = 0;
     tossedProjectileVelocities.length = 0;
     projectileCurrentLives.length = 0;
+    projectileTrails.length = 0;
     isProjectileInFlight = false;
 
     console.log("New maze loaded and player reset.");
@@ -2542,19 +2945,19 @@ function loadNewMaze() {
 function generateMaze(size) {
     // Initialize grid with all walls
     const grid = Array(size).fill().map(() => Array(size).fill(0));
-    
+
     // Create a grid with cell values
     // 0 = wall, 1 = path
-    
+
     // We'll use odd coordinates for walls and even coordinates for cells
     // Start from a random even coordinate (1, 1) to (size-2, size-2)
     const startX = 1;
     const startZ = 1;
     grid[startX][startZ] = 1; // Mark as path
-    
+
     // Using a stack for depth-first traversal
     const stack = [{x: startX, z: startZ}];
-    
+
     // Possible directions to move in the grid [dx, dz]
     const directions = [
         [0, -2], // North (move 2 cells to skip walls)
@@ -2562,33 +2965,33 @@ function generateMaze(size) {
         [0, 2],  // South
         [-2, 0]  // West
     ];
-    
+
     while (stack.length > 0) {
         const current = stack[stack.length - 1];
-        
+
         // Find unvisited neighbors (must be at least 2 cells away due to walls)
         const unvisitedNeighbors = [];
-        
+
         for (const [dx, dz] of directions) {
             const nx = current.x + dx;
             const nz = current.z + dz;
-            
+
             // Check if this neighbor is valid (in bounds and unvisited)
             if (nx > 0 && nx < size - 1 && nz > 0 && nz < size - 1 && grid[nx][nz] === 0) {
                 unvisitedNeighbors.push({x: nx, z: nz, dx: dx/2, dz: dz/2});
             }
         }
-        
+
         if (unvisitedNeighbors.length > 0) {
             // Choose a random unvisited neighbor
             const next = unvisitedNeighbors[Math.floor(Math.random() * unvisitedNeighbors.length)];
-            
+
             // Carve a path to this neighbor by marking the wall in between as a path
             grid[current.x + next.dx][current.z + next.dz] = 1;
-            
+
             // Mark the neighbor cell as a path
             grid[next.x][next.z] = 1;
-            
+
             // Add the neighbor to the stack
             stack.push({x: next.x, z: next.z});
         } else {
@@ -2596,7 +2999,7 @@ function generateMaze(size) {
             stack.pop();
         }
     }
-    
+
     return grid;
 }
 
@@ -2727,58 +3130,168 @@ function createSegmentedFloorWithPit(totalWidth, totalDepth, pitX, pitZ, pitSize
 // NEW: Function to throw projectile
 function throwProjectile() {
     if (!camera) return;
-    
+
     // Check if we've reached the maximum number of projectiles
     if (tossedProjectileMeshes.length >= MAX_PROJECTILES) {
         // Find any dead projectiles and remove them
         for (let i = tossedProjectileMeshes.length - 1; i >= 0; i--) {
             if (projectileCurrentLives[i] <= 0) {
+                // Remove projectile
                 scene.remove(tossedProjectileMeshes[i]);
+
+                // Remove trail segments
+                if (projectileTrails[i]) {
+                    for (const segment of projectileTrails[i]) {
+                        scene.remove(segment);
+                    }
+                }
+
+                // Remove from arrays
                 tossedProjectileMeshes.splice(i, 1);
                 tossedProjectileVelocities.splice(i, 1);
                 projectileCurrentLives.splice(i, 1);
+                projectileTrails.splice(i, 1);
             }
         }
-        
+
         // If still at max capacity, return
         if (tossedProjectileMeshes.length >= MAX_PROJECTILES) {
             console.log(`Maximum projectiles (${MAX_PROJECTILES}) already in flight.`);
             return;
         }
     }
-    
-    // Create a new projectile
-    const tossedProjectileGeom = new THREE.SphereGeometry(0.1, 8, 8);
-    const tossedProjectileMat = new THREE.MeshStandardMaterial({ 
-        color: PROJECTILE_ECHO_PARTICLE_COLOR,
-        emissive: PROJECTILE_ECHO_PARTICLE_COLOR,
-        emissiveIntensity: 0.7
+
+    // Create a new projectile with custom shader
+    const tossedProjectileGeom = new THREE.SphereGeometry(0.1, 16, 16);
+
+    // Create custom shader material for projectile
+    const tossedProjectileMat = new THREE.ShaderMaterial({
+        uniforms: {
+            time: { value: 0.0 },
+            color: { value: new THREE.Color(PROJECTILE_ECHO_PARTICLE_COLOR) },
+            pulseSpeed: { value: 2.0 },
+            glowStrength: { value: 1.2 }
+        },
+        vertexShader: `
+            uniform float time;
+            varying vec3 vNormal;
+            varying vec3 vPosition;
+            varying vec2 vUv;
+            varying vec3 vViewPosition;
+
+            void main() {
+                vNormal = normalize(normalMatrix * normal);
+                vPosition = position;
+                vUv = uv;
+
+                // Add subtle vertex displacement for energy effect
+                float displacement = sin(position.x * 10.0 + time * 3.0) *
+                                    sin(position.y * 10.0 + time * 2.0) *
+                                    sin(position.z * 10.0 + time * 2.5) * 0.01;
+
+                vec3 newPosition = position + normal * displacement;
+
+                vec4 mvPosition = modelViewMatrix * vec4(newPosition, 1.0);
+                vViewPosition = -mvPosition.xyz;
+                gl_Position = projectionMatrix * mvPosition;
+            }
+        `,
+        fragmentShader: `
+            uniform float time;
+            uniform vec3 color;
+            uniform float pulseSpeed;
+            uniform float glowStrength;
+
+            varying vec3 vNormal;
+            varying vec3 vPosition;
+            varying vec2 vUv;
+            varying vec3 vViewPosition;
+
+            void main() {
+                // Calculate fresnel effect for edge glow
+                vec3 normal = normalize(vNormal);
+                vec3 viewDirection = normalize(vViewPosition);
+                float fresnel = pow(1.0 - clamp(dot(normal, viewDirection), 0.0, 1.0), 3.0);
+
+                // Create energy pattern
+                float pattern1 = sin(vPosition.x * 20.0 + time * 2.0) *
+                                sin(vPosition.y * 20.0 + time * 1.5) *
+                                sin(vPosition.z * 20.0 + time * 2.5);
+
+                // Create pulsing effect
+                float pulse = sin(time * pulseSpeed) * 0.5 + 0.5;
+
+                // Create swirling energy pattern
+                float swirl = sin(vUv.x * 10.0 + time * 2.0) * cos(vUv.y * 10.0 + time * 1.5) * 0.5 + 0.5;
+
+                // Combine effects
+                vec3 baseColor = color * (0.6 + pulse * 0.4);
+                vec3 energyColor = mix(baseColor, vec3(1.0, 0.8, 1.0), pattern1 * 0.3);
+                vec3 finalColor = mix(energyColor, vec3(1.0, 0.6, 1.0), swirl * 0.3);
+
+                // Add fresnel glow
+                finalColor = mix(finalColor, vec3(1.0, 0.8, 1.0), fresnel * glowStrength);
+
+                // Adjust opacity for energy effect
+                float opacity = 0.7 + fresnel * 0.3 + pulse * 0.2;
+
+                gl_FragColor = vec4(finalColor, opacity);
+            }
+        `,
+        transparent: true,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending
     });
+
     const newProjectile = new THREE.Mesh(tossedProjectileGeom, tossedProjectileMat);
-    
+
     // Set projectile start position
     newProjectile.position.copy(camera.position);
     // Offset slightly in front of camera so it doesn't spawn inside player
     const offsetDirection = new THREE.Vector3();
     camera.getWorldDirection(offsetDirection);
     newProjectile.position.addScaledVector(offsetDirection, 0.5);
-    
+
     // Add to scene
     scene.add(newProjectile);
-    
+
     // Set velocity
     const newVelocity = new THREE.Vector3();
     camera.getWorldDirection(newVelocity);
     newVelocity.multiplyScalar(PROJECTILE_SPEED);
-    
+
+    // Create trail effect for the projectile
+    const trailMaterial = new THREE.MeshBasicMaterial({
+        color: PROJECTILE_ECHO_PARTICLE_COLOR,
+        transparent: true,
+        opacity: TRAIL_OPACITY,
+        blending: THREE.AdditiveBlending
+    });
+
+    // Create trail segments
+    const trailSegments = [];
+    for (let i = 0; i < TRAIL_LENGTH; i++) {
+        // Create smaller spheres for the trail
+        const segmentSize = 0.08 * (1 - i / TRAIL_LENGTH); // Gradually smaller
+        const trailSegment = new THREE.Mesh(
+            new THREE.SphereGeometry(segmentSize, 8, 8),
+            trailMaterial.clone() // Clone material so we can adjust opacity per segment
+        );
+        trailSegment.material.opacity = TRAIL_OPACITY * (1 - i / TRAIL_LENGTH); // Fade out
+        trailSegment.visible = false; // Start invisible
+        scene.add(trailSegment);
+        trailSegments.push(trailSegment);
+    }
+
     // Add to arrays
     tossedProjectileMeshes.push(newProjectile);
     tossedProjectileVelocities.push(newVelocity);
     projectileCurrentLives.push(PROJECTILE_MAX_LIFE);
-    
+    projectileTrails.push(trailSegments);
+
     // Set flag
     isProjectileInFlight = true;
-    
+
     console.log(`Projectile thrown! Total projectiles in flight: ${tossedProjectileMeshes.length}`);
 }
 
@@ -2788,7 +3301,7 @@ function renderMiniMap() {
     // Clear the mini-map
     miniMapContext.fillStyle = 'rgba(0, 0, 0, 0.7)';
     miniMapContext.fillRect(0, 0, miniMapCanvas.width, miniMapCanvas.height);
-    
+
     const mapWidth = miniMapCanvas.width;
     const mapHeight = miniMapCanvas.height;
     const centerX = mapWidth / 2;
@@ -2850,9 +3363,9 @@ function renderMiniMap() {
         miniMapContext.arc(projectilePowerUpX, projectilePowerUpZ, 6, 0, Math.PI * 2);
         miniMapContext.fill();
     }
-    
+
     // Draw puzzle door if active and exists
-    if (isPuzzleDoorActive && puzzleDoorMesh) { 
+    if (isPuzzleDoorActive && puzzleDoorMesh) {
         if (puzzleDoorMesh.visible) { // Only draw panel if it's visible
             miniMapContext.fillStyle = 'rgba(150, 75, 0, 0.8)'; // Brownish for door panel
             const doorAABB = puzzleDoorMesh.userData.aabb; // Assuming AABB is in world space or accurately reflects world position/size
@@ -2861,8 +3374,8 @@ function renderMiniMap() {
                 const doorCenterX = centerX + puzzleDoorMesh.position.x * miniMapScale;
                 const doorCenterZ = centerZ + puzzleDoorMesh.position.z * miniMapScale;
                 const doorWidthOnMap = (puzzleDoorMesh.rotation.y === Math.PI / 2 ? DOOR_THICKNESS : DOOR_WIDTH) * miniMapScale;
-                const doorHeightOnMap = (puzzleDoorMesh.rotation.y === Math.PI / 2 ? DOOR_WIDTH : DOOR_THICKNESS) * miniMapScale; 
-                
+                const doorHeightOnMap = (puzzleDoorMesh.rotation.y === Math.PI / 2 ? DOOR_WIDTH : DOOR_THICKNESS) * miniMapScale;
+
                 miniMapContext.save();
                 miniMapContext.translate(doorCenterX, doorCenterZ);
                 miniMapContext.rotate(puzzleDoorMesh.rotation.y); // Align with door's rotation
@@ -2896,17 +3409,17 @@ function renderMiniMap() {
             }
         }
     }
-    
+
     // Draw player position (cyan circle with direction indicator)
     if (camera) {
         const playerX = centerX + camera.position.x * miniMapScale;
         const playerZ = centerZ + camera.position.z * miniMapScale;
-        
+
         // Draw player direction indicator first (behind the player dot)
         const direction = new THREE.Vector3();
         camera.getWorldDirection(direction);
         direction.normalize();
-        
+
         miniMapContext.strokeStyle = 'rgba(0, 255, 255, 0.9)';
         miniMapContext.lineWidth = 2;
         miniMapContext.beginPath();
@@ -2916,19 +3429,19 @@ function renderMiniMap() {
             playerZ + direction.z * 15
         );
         miniMapContext.stroke();
-        
+
         // Draw player circle on top
         miniMapContext.fillStyle = 'rgba(0, 255, 255, 1.0)';
         miniMapContext.beginPath();
         miniMapContext.arc(playerX, playerZ, 5, 0, Math.PI * 2);
         miniMapContext.fill();
     }
-    
+
     // Draw border around minimap
     miniMapContext.strokeStyle = 'rgba(0, 255, 255, 0.7)';
     miniMapContext.lineWidth = 2;
     miniMapContext.strokeRect(0, 0, mapWidth, mapHeight);
-} 
+}
 
 // New function to handle VR controller interactions
 function setupVRControllers() {
@@ -2942,7 +3455,7 @@ function setupVRControllers() {
         console.log('Controller 1 connected:', event.data);
         controller1.gamepad = event.data.gamepad;
     });
-    controller1.addEventListener('disconnected', () => { 
+    controller1.addEventListener('disconnected', () => {
         console.log('Controller 1 disconnected');
         controller1.gamepad = null;
     });
@@ -2958,7 +3471,7 @@ function setupVRControllers() {
         console.log('Controller 2 connected:', event.data);
         controller2.gamepad = event.data.gamepad;
     });
-    controller2.addEventListener('disconnected', () => { 
+    controller2.addEventListener('disconnected', () => {
         console.log('Controller 2 disconnected');
         controller2.gamepad = null;
     });
@@ -2974,7 +3487,7 @@ function setupVRControllers() {
     controllerGrip2 = renderer.xr.getControllerGrip(1);
     controllerGrip2.add(controllerModelFactory.createControllerModel(controllerGrip2));
     scene.add(controllerGrip2);
-    
+
     // Add visible rays to controllers
     const geometry = new THREE.BufferGeometry().setFromPoints([
         new THREE.Vector3(0, 0, 0),
@@ -2993,7 +3506,7 @@ function setupVRControllers() {
 
     controller1.add(line.clone());
     controller2.add(line.clone());
-    
+
     // Set initial visibility based on VR state
     controller1.visible = false;
     controller2.visible = false;
@@ -3005,11 +3518,11 @@ function setupVRControllers() {
 function onSelectStart(event) {
     // Get the controller from the event
     const controller = event.target;
-    
+
     // Log controller event for debugging
-    console.log("Select start event on controller:", 
+    console.log("Select start event on controller:",
                 controller === controller1 ? "1 (left?)" : "2 (right?)");
-    
+
     if (isProjectileEchoPowerUpActive) {
         // Throw projectile when the trigger is pressed in VR
         throwProjectileVR(controller);
@@ -3021,73 +3534,187 @@ function onSelectStart(event) {
                 console.log("Moved using reference space!");
             }
         }
-        
+
         // Trigger a regular echo
         const controllerPosition = new THREE.Vector3();
         controller.getWorldPosition(controllerPosition);
-        
+
         // Log echo position
-        console.log("Triggering echo at position:", 
-                   controllerPosition.x.toFixed(2), 
-                   controllerPosition.y.toFixed(2), 
+        console.log("Triggering echo at position:",
+                   controllerPosition.x.toFixed(2),
+                   controllerPosition.y.toFixed(2),
                    controllerPosition.z.toFixed(2));
-                   
+
         triggerEcho(controllerPosition);
     }
 }
 
 function throwProjectileVR(controller) {
     if (!isProjectileEchoPowerUpActive) return;
-    
+
     // Check if we've reached the maximum number of projectiles
     if (tossedProjectileMeshes.length >= MAX_PROJECTILES) {
         // Find any dead projectiles and remove them
         for (let i = tossedProjectileMeshes.length - 1; i >= 0; i--) {
             if (projectileCurrentLives[i] <= 0) {
+                // Remove projectile
                 scene.remove(tossedProjectileMeshes[i]);
+
+                // Remove trail segments
+                if (projectileTrails[i]) {
+                    for (const segment of projectileTrails[i]) {
+                        scene.remove(segment);
+                    }
+                }
+
+                // Remove from arrays
                 tossedProjectileMeshes.splice(i, 1);
                 tossedProjectileVelocities.splice(i, 1);
                 projectileCurrentLives.splice(i, 1);
+                projectileTrails.splice(i, 1);
             }
         }
-        
+
         // If still at max capacity, return
         if (tossedProjectileMeshes.length >= MAX_PROJECTILES) {
             console.log(`Maximum projectiles (${MAX_PROJECTILES}) already in flight.`);
             return;
         }
     }
-    
+
     // Get controller position and orientation
     const controllerPosition = new THREE.Vector3();
     controller.getWorldPosition(controllerPosition);
-    
+
     // Create a direction vector pointing where the controller is pointing
     const controllerDirection = new THREE.Vector3(0, 0, -1);
     controllerDirection.applyQuaternion(controller.quaternion);
     controllerDirection.normalize();
-    
-    // Create projectile at the controller's position
-    const projectileGeometry = new THREE.SphereGeometry(0.1, 8, 8);
-    const projectileMaterial = new THREE.MeshBasicMaterial({ color: PROJECTILE_ECHO_PARTICLE_COLOR });
+
+    // Create projectile at the controller's position with the same custom shader
+    const projectileGeometry = new THREE.SphereGeometry(0.1, 16, 16);
+
+    // Create custom shader material for projectile (same as non-VR projectile)
+    const projectileMaterial = new THREE.ShaderMaterial({
+        uniforms: {
+            time: { value: 0.0 },
+            color: { value: new THREE.Color(PROJECTILE_ECHO_PARTICLE_COLOR) },
+            pulseSpeed: { value: 2.0 },
+            glowStrength: { value: 1.2 }
+        },
+        vertexShader: `
+            uniform float time;
+            varying vec3 vNormal;
+            varying vec3 vPosition;
+            varying vec2 vUv;
+            varying vec3 vViewPosition;
+
+            void main() {
+                vNormal = normalize(normalMatrix * normal);
+                vPosition = position;
+                vUv = uv;
+
+                // Add subtle vertex displacement for energy effect
+                float displacement = sin(position.x * 10.0 + time * 3.0) *
+                                    sin(position.y * 10.0 + time * 2.0) *
+                                    sin(position.z * 10.0 + time * 2.5) * 0.01;
+
+                vec3 newPosition = position + normal * displacement;
+
+                vec4 mvPosition = modelViewMatrix * vec4(newPosition, 1.0);
+                vViewPosition = -mvPosition.xyz;
+                gl_Position = projectionMatrix * mvPosition;
+            }
+        `,
+        fragmentShader: `
+            uniform float time;
+            uniform vec3 color;
+            uniform float pulseSpeed;
+            uniform float glowStrength;
+
+            varying vec3 vNormal;
+            varying vec3 vPosition;
+            varying vec2 vUv;
+            varying vec3 vViewPosition;
+
+            void main() {
+                // Calculate fresnel effect for edge glow
+                vec3 normal = normalize(vNormal);
+                vec3 viewDirection = normalize(vViewPosition);
+                float fresnel = pow(1.0 - clamp(dot(normal, viewDirection), 0.0, 1.0), 3.0);
+
+                // Create energy pattern
+                float pattern1 = sin(vPosition.x * 20.0 + time * 2.0) *
+                                sin(vPosition.y * 20.0 + time * 1.5) *
+                                sin(vPosition.z * 20.0 + time * 2.5);
+
+                // Create pulsing effect
+                float pulse = sin(time * pulseSpeed) * 0.5 + 0.5;
+
+                // Create swirling energy pattern
+                float swirl = sin(vUv.x * 10.0 + time * 2.0) * cos(vUv.y * 10.0 + time * 1.5) * 0.5 + 0.5;
+
+                // Combine effects
+                vec3 baseColor = color * (0.6 + pulse * 0.4);
+                vec3 energyColor = mix(baseColor, vec3(1.0, 0.8, 1.0), pattern1 * 0.3);
+                vec3 finalColor = mix(energyColor, vec3(1.0, 0.6, 1.0), swirl * 0.3);
+
+                // Add fresnel glow
+                finalColor = mix(finalColor, vec3(1.0, 0.8, 1.0), fresnel * glowStrength);
+
+                // Adjust opacity for energy effect
+                float opacity = 0.7 + fresnel * 0.3 + pulse * 0.2;
+
+                gl_FragColor = vec4(finalColor, opacity);
+            }
+        `,
+        transparent: true,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending
+    });
+
     const newProjectile = new THREE.Mesh(projectileGeometry, projectileMaterial);
     newProjectile.position.copy(controllerPosition);
     scene.add(newProjectile);
-    
+
     // Set velocity in the controller's forward direction
     const newVelocity = controllerDirection.clone().multiplyScalar(PROJECTILE_SPEED);
-    
+
+    // Create trail effect for the projectile
+    const trailMaterial = new THREE.MeshBasicMaterial({
+        color: PROJECTILE_ECHO_PARTICLE_COLOR,
+        transparent: true,
+        opacity: TRAIL_OPACITY,
+        blending: THREE.AdditiveBlending
+    });
+
+    // Create trail segments
+    const trailSegments = [];
+    for (let i = 0; i < TRAIL_LENGTH; i++) {
+        // Create smaller spheres for the trail
+        const segmentSize = 0.08 * (1 - i / TRAIL_LENGTH); // Gradually smaller
+        const trailSegment = new THREE.Mesh(
+            new THREE.SphereGeometry(segmentSize, 8, 8),
+            trailMaterial.clone() // Clone material so we can adjust opacity per segment
+        );
+        trailSegment.material.opacity = TRAIL_OPACITY * (1 - i / TRAIL_LENGTH); // Fade out
+        trailSegment.visible = false; // Start invisible
+        scene.add(trailSegment);
+        trailSegments.push(trailSegment);
+    }
+
     // Add to arrays
     tossedProjectileMeshes.push(newProjectile);
     tossedProjectileVelocities.push(newVelocity);
     projectileCurrentLives.push(PROJECTILE_MAX_LIFE);
-    
+    projectileTrails.push(trailSegments);
+
     // Set flag
     isProjectileInFlight = true;
-    
+
     // Sound effect if available
     // playProjectileEchoSound(); // Uncomment if this function exists
-    
+
     console.log(`VR Projectile thrown! Total projectiles in flight: ${tossedProjectileMeshes.length}`);
 }
 
@@ -3100,30 +3727,30 @@ function onSelectEnd(event) {
 function onVRSessionChange(session) {
     isInVR = !!session;
     console.log("VR session changed:", isInVR ? "Entered VR" : "Exited VR");
-    
+
     // Show/hide controllers based on VR state
     if (controller1 && controller2) {
         controller1.visible = isInVR;
         controller2.visible = isInVR;
         controllerGrip1.visible = isInVR;
         controllerGrip2.visible = isInVR;
-        
+
         // Debug controller state when entering VR
         if (isInVR) {
             console.log("Controllers visible. Checking input sources...");
-            
+
             // Create debug display when entering VR
             vrDebugDisplay = createVRDebugDisplay();
-            
+
             // Create VR mini-map
             createVRMiniMap();
-            
+
             // Check input sources after a short delay to ensure they're initialized
             setTimeout(() => {
                 if (session) {
                     const inputSources = Array.from(session.inputSources);
                     console.log(`Found ${inputSources.length} input sources`);
-                    
+
                     inputSources.forEach((source, i) => {
                         console.log(`Input source ${i}:`);
                         console.log(`- Handedness: ${source.handedness}`);
@@ -3141,27 +3768,27 @@ function onVRSessionChange(session) {
             vrMiniMap = null;
         }
     }
-    
+
     // Handle other VR-specific adjustments
     if (isInVR) {
         // Disable pointer lock controls in VR
         if (controls && controls.isLocked) {
             controls.unlock();
         }
-        
+
         // Place player at starting position in VR
         camera.position.set(PLAYER_START_X, playerHeight, PLAYER_START_Z);
-        
+
         // Hide reticle in VR
         if (reticle) reticle.style.display = 'none';
-        
+
         // Hide mini-map in VR (optional, you might want to implement a different way to show it)
         if (miniMapCanvas) miniMapCanvas.style.display = 'none';
     } else {
         // Re-enable mouse look when exiting VR
         if (reticle) reticle.style.display = 'block';
         if (miniMapCanvas) miniMapCanvas.style.display = 'block';
-        
+
         // Re-enable controls for desktop mode
         setupControls();
     }
@@ -3183,50 +3810,115 @@ function onSqueezeEnd(event) {
 // Handle VR movement
 function handleVRMovement(deltaTime, xrFrame) { // Added xrFrame parameter
     if (!isInVR || !xrFrame) return; // Check for xrFrame too
-    
+
     try {
         // Get the XR session
         const session = renderer.xr.getSession();
         if (!session) {
             return;
         }
-        
+
         // Get input sources and their gamepad data
         const inputSources = Array.from(session.inputSources);
-        
+
         // Find the left controller for movement
-        const leftController = inputSources.find(source => 
+        const leftController = inputSources.find(source =>
             source.handedness === 'left' && source.gamepad);
-        
+
         if (!leftController || !leftController.gamepad) {
             return; // No left controller with gamepad found
         }
-        
+
         const gamepad = leftController.gamepad;
-        
+
         // Based on your debug, Quest 2 left thumbstick uses axes[2] for X and axes[3] for Y
         let axisX = 0;
         let axisY = 0;
-        
+
         if (gamepad.axes.length >= 4) {
-            axisX = gamepad.axes[2]; 
+            axisX = gamepad.axes[2];
             axisY = gamepad.axes[3];
-            
+
             // Only process movement if there's significant input
             if (Math.abs(axisX) >= 0.2 || Math.abs(axisY) >= 0.2) { // Changed from && to ||, and removed early return
                 // axisY = -axisY; // This line is removed to not invert the Y axis
-                
+
                 // Debug on significant input
                 console.log(`Left stick input: X=${axisX.toFixed(2)}, Y=${axisY.toFixed(2)}`);
-                
+
                 // Try moving with reference space first (more reliable method on Quest)
                 // const movedWithReferenceSpace = movePlayerWithReferenceSpace(axisX, axisY, deltaTime); // Original line if needed for fallback
                 movePlayerWithReferenceSpace(axisX, axisY, deltaTime); // Directly call, assume it works or handles its own errors
-                
+
                 // Fallback to camera rig movement is removed for now, assuming reference space works.
             }
             // REMOVED: else block that would previously return if input was too low.
             // Now, even if left stick input is low, we proceed to right stick logic.
+        }
+
+        // Handle flying with secondary trigger on right controller
+        // Check if secondary trigger is pressed
+        if (vrControllerInputs.right.flyButtonPressed) {
+            // Activate flying mode
+            isFlying = true;
+
+            // Move upward while secondary trigger is pressed
+            const referenceSpace = renderer.xr.getReferenceSpace();
+            if (referenceSpace) {
+                // Create a transform that moves the player upward
+                // Note: In WebXR, positive Y is up, but we need to negate it for the transform
+                const transform = new XRRigidTransform(
+                    {x: 0, y: -FLY_SPEED * deltaTime, z: 0}, // Negative Y to move upward
+                    {x: 0, y: 0, z: 0, w: 1}
+                );
+
+                // Apply the transform to the reference space
+                const newReferenceSpace = referenceSpace.getOffsetReferenceSpace(transform);
+                renderer.xr.setReferenceSpace(newReferenceSpace);
+
+                console.log("Flying upward");
+            }
+        } else if (isFlying) {
+            // Secondary trigger was released, apply gravity
+            isFlying = false;
+
+            // Apply gravity when not flying
+            const referenceSpace = renderer.xr.getReferenceSpace();
+            if (referenceSpace) {
+                // Get the camera to determine current height
+                const xrCamera = renderer.xr.getCamera();
+                const cameraPosition = new THREE.Vector3();
+                xrCamera.getWorldPosition(cameraPosition);
+
+                // Only apply gravity if above ground level
+                if (cameraPosition.y > playerHeight) {
+                    // Calculate gravity movement
+                    const gravityMovement = FLY_GRAVITY * deltaTime;
+
+                    // Create a transform that moves the player downward
+                    // Note: In WebXR transforms, positive Y in the transform moves downward
+                    const transform = new XRRigidTransform(
+                        {x: 0, y: Math.min(gravityMovement, cameraPosition.y - playerHeight), z: 0}, // Positive Y to move downward
+                        {x: 0, y: 0, z: 0, w: 1}
+                    );
+
+                    // Apply the transform to the reference space
+                    const newReferenceSpace = referenceSpace.getOffsetReferenceSpace(transform);
+                    renderer.xr.setReferenceSpace(newReferenceSpace);
+
+                    console.log("Applying gravity");
+                } else {
+                    // Reset to exactly player height if we're below it
+                    // Note: In WebXR transforms, the sign is reversed
+                    const transform = new XRRigidTransform(
+                        {x: 0, y: -(playerHeight - cameraPosition.y), z: 0}, // Negative to move upward
+                        {x: 0, y: 0, z: 0, w: 1}
+                    );
+
+                    const newReferenceSpace = referenceSpace.getOffsetReferenceSpace(transform);
+                    renderer.xr.setReferenceSpace(newReferenceSpace);
+                }
+            }
         }
 
         // --- Right Thumbstick Smooth Turning ---
@@ -3261,12 +3953,12 @@ function handleVRMovement(deltaTime, xrFrame) { // Added xrFrame parameter
                     // This is the position part of an XRRigidTransform that rotates around P_cam_rs.
                     const P_cam_rs_rotated_by_q_turn = P_cam_rs.clone().applyQuaternion(q_turn);
                     const T_offset_position_vec = P_cam_rs.clone().sub(P_cam_rs_rotated_by_q_turn);
-                    
+
                     const transform_offset = new XRRigidTransform(
-                        { x: T_offset_position_vec.x, y: T_offset_position_vec.y, z: T_offset_position_vec.z }, 
+                        { x: T_offset_position_vec.x, y: T_offset_position_vec.y, z: T_offset_position_vec.z },
                         { x: q_turn.x, y: q_turn.y, z: q_turn.z, w: q_turn.w }
                     );
-                    
+
                     const newReferenceSpace = currentReferenceSpace.getOffsetReferenceSpace(transform_offset);
                     renderer.xr.setReferenceSpace(newReferenceSpace);
                 } else {
@@ -3291,7 +3983,7 @@ function setupControls() {
             console.log('Pointer locked');
             if (reticle) reticle.style.display = 'block';
         });
-        
+
         controls.addEventListener('unlock', () => {
             console.log('Pointer unlocked');
             if (reticle) reticle.style.display = 'none';
@@ -3313,22 +4005,22 @@ function createVRDebugDisplay() {
     debugCanvas.style.zIndex = '100';
     debugCanvas.style.background = 'rgba(0,0,0,0.5)';
     document.body.appendChild(debugCanvas);
-    
+
     const ctx = debugCanvas.getContext('2d');
-    
+
     // Create a texture from this canvas
     const debugTexture = new THREE.CanvasTexture(debugCanvas);
-    
+
     // Create a plane to display the debug info in VR
     const debugPlane = new THREE.Mesh(
         new THREE.PlaneGeometry(0.2, 0.1),
-        new THREE.MeshBasicMaterial({ 
+        new THREE.MeshBasicMaterial({
             map: debugTexture,
             transparent: true,
             opacity: 0.8
         })
     );
-    
+
     // Attach to the left controller
     if (controller1) {
         controller1.add(debugPlane);
@@ -3336,32 +4028,32 @@ function createVRDebugDisplay() {
         debugPlane.position.set(0, 0.1, -0.05);
         debugPlane.rotation.x = -Math.PI / 4; // Tilt for better visibility
     }
-    
+
     // Function to update the debug display
     function updateDebugDisplay(leftAxes, rightAxes) {
         ctx.clearRect(0, 0, debugCanvas.width, debugCanvas.height);
-        
+
         // Background
         ctx.fillStyle = 'rgba(0,0,0,0.7)';
         ctx.fillRect(0, 0, debugCanvas.width, debugCanvas.height);
-        
+
         // Draw title
         ctx.fillStyle = 'white';
         ctx.font = '16px Arial';
         ctx.fillText('Controller Input Debug', 10, 20);
-        
+
         // Left controller axes
         ctx.fillStyle = 'cyan';
         ctx.fillText('Left: ' + (leftAxes ? `X: ${leftAxes[2].toFixed(2)}, Y: ${leftAxes[3].toFixed(2)}` : 'N/A'), 10, 50);
-        
+
         // Right controller axes
         ctx.fillStyle = 'yellow';
         ctx.fillText('Right: ' + (rightAxes ? `X: ${rightAxes[0].toFixed(2)}, Y: ${rightAxes[1].toFixed(2)}` : 'N/A'), 10, 80);
-        
+
         // Update the texture
         debugTexture.needsUpdate = true;
     }
-    
+
     return {
         update: updateDebugDisplay,
         plane: debugPlane
@@ -3374,28 +4066,28 @@ let vrDebugDisplay = null;
 // Create a function to try moving using the XR reference space directly
 function updateReferenceSpace() {
     if (!isInVR || !renderer.xr.isPresenting) return;
-    
+
     try {
         const referenceSpace = renderer.xr.getReferenceSpace();
         if (!referenceSpace) {
             console.log("No reference space available");
             return false;
         }
-        
+
         console.log("Found reference space:", referenceSpace.type);
-        
+
         // Create transform for the offset
         const transform = new XRRigidTransform(
             {x: 0, y: 0, z: -0.1}, // Move forward 10cm (hardcoded test)
             {x: 0, y: 0, z: 0, w: 1}
         );
-        
+
         // Get a new offset reference space
         const newReferenceSpace = referenceSpace.getOffsetReferenceSpace(transform);
-        
+
         // Update the reference space
         renderer.xr.setReferenceSpace(newReferenceSpace);
-        
+
         console.log("Successfully updated reference space");
         return true;
     } catch (error) {
@@ -3407,87 +4099,87 @@ function updateReferenceSpace() {
 // Create a function to directly move the player using reference space in VR based on controller input
 function movePlayerWithReferenceSpace(xAxis, yAxis, deltaTime) {
     if (!isInVR || !renderer.xr.isPresenting) return false;
-    
+
     try {
         const referenceSpace = renderer.xr.getReferenceSpace();
         if (!referenceSpace) {
             return false;
         }
-        
+
         // Get the camera to determine forward direction
         const xrCamera = renderer.xr.getCamera();
-        
+
         // Get forward and right vectors from camera orientation
         const forward = new THREE.Vector3(0, 0, -1);
         forward.applyQuaternion(xrCamera.quaternion);
         forward.y = 0; // Keep movement horizontal
         forward.normalize();
-        
+
         const right = new THREE.Vector3(1, 0, 0);
         right.applyQuaternion(xrCamera.quaternion);
         right.y = 0;
         right.normalize();
-        
+
         // Calculate movement vector
         const moveVector = new THREE.Vector3();
-        
+
         // Apply input (yAxis for forward/back, xAxis for left/right)
         // Note: we're NOT inverting Y axis now as requested by user
         if (Math.abs(yAxis) > 0.2) {
             moveVector.addScaledVector(forward, yAxis * VR_MOVE_SPEED * deltaTime);
         }
-        
+
         // Fix X-axis: Invert X for correct left/right movement
         if (Math.abs(xAxis) > 0.2) {
             moveVector.addScaledVector(right, -xAxis * VR_MOVE_SPEED * deltaTime); // Negative sign to invert X axis
         }
-        
+
         // Apply a moderate multiplier for more noticeable movement
         moveVector.multiplyScalar(2.0); // Reduced from 10 to 2
-        
+
         if (moveVector.lengthSq() > 0) {
             // Create XRRigidTransform for movement
             const transform = new XRRigidTransform(
                 {x: moveVector.x, y: 0, z: moveVector.z},
                 {x: 0, y: 0, z: 0, w: 1}
             );
-            
+
             // Get new reference space with offset
             const newReferenceSpace = referenceSpace.getOffsetReferenceSpace(transform);
-            
+
             // Update the reference space
             renderer.xr.setReferenceSpace(newReferenceSpace);
-            
+
             // Log movement occasionally but not for every minor movement
             if (moveVector.length() > 0.05) {
                 console.log("Reference space movement:", moveVector.x.toFixed(2), moveVector.z.toFixed(2));
             }
-            
+
             // Drop a marker to visualize movement (only on significant movement)
             if (Math.abs(xAxis) > 0.7 || Math.abs(yAxis) > 0.7) {
                 const marker = new THREE.Mesh(
                     new THREE.SphereGeometry(0.05),
                     new THREE.MeshBasicMaterial({color: 0x00ff00}) // Green for reference space movement
                 );
-                
+
                 // Get the current camera position to place the marker
                 const position = new THREE.Vector3();
                 xrCamera.getWorldPosition(position);
-                
+
                 marker.position.copy(position);
                 marker.position.y = 0; // Place on the ground
-                
+
                 scene.add(marker);
-                
+
                 // Remove marker after 2 seconds
                 setTimeout(() => {
                     scene.remove(marker);
                 }, 2000);
             }
-            
+
             return true;
         }
-        
+
         return false;
     } catch (error) {
         console.error("Error moving with reference space:", error);
@@ -3506,19 +4198,19 @@ function createVRMiniMap() {
     vrMiniMapCanvas.width = 256;
     vrMiniMapCanvas.height = 256;
     const ctx = vrMiniMapCanvas.getContext('2d');
-    
+
     // Fill with black background initially
     ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
     ctx.fillRect(0, 0, vrMiniMapCanvas.width, vrMiniMapCanvas.height);
-    
+
     // Create a border
     ctx.strokeStyle = 'rgba(0, 255, 255, 0.8)';
     ctx.lineWidth = 3;
     ctx.strokeRect(3, 3, vrMiniMapCanvas.width - 6, vrMiniMapCanvas.height - 6);
-    
+
     // Create texture
     vrMiniMapTexture = new THREE.CanvasTexture(vrMiniMapCanvas);
-    
+
     // Create a plane to display the mini-map in VR
     const plane = new THREE.Mesh(
         new THREE.PlaneGeometry(0.15, 0.15), // Smaller size
@@ -3529,7 +4221,7 @@ function createVRMiniMap() {
             side: THREE.DoubleSide
         })
     );
-    
+
     // Attach to the right controller wrist area
     if (controller2) {
         controller2.add(plane);
@@ -3538,7 +4230,7 @@ function createVRMiniMap() {
         plane.rotation.x = -Math.PI / 3; // Angle for better visibility
         plane.rotation.z = Math.PI; // Flip to be readable
     }
-    
+
     vrMiniMap = plane;
     return plane;
 }
@@ -3546,18 +4238,18 @@ function createVRMiniMap() {
 // Function to update the VR mini-map
 function updateVRMiniMap() {
     if (!vrMiniMapCanvas || !vrMiniMapTexture || !isInVR) return;
-    
+
     const ctx = vrMiniMapCanvas.getContext('2d');
-    
+
     // Clear the mini-map
     ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
     ctx.fillRect(0, 0, vrMiniMapCanvas.width, vrMiniMapCanvas.height);
-    
+
     const mapWidth = vrMiniMapCanvas.width;
     const mapHeight = vrMiniMapCanvas.height;
     const centerX = mapWidth / 2;
     const centerZ = mapHeight / 2;
-    
+
     // Draw the floor segments (dark gray)
     ctx.fillStyle = 'rgba(50, 50, 50, 0.5)';
     for (const floor of floorSegments) {
@@ -3570,7 +4262,7 @@ function updateVRMiniMap() {
             ctx.fillRect(mapX, mapZ, width, height);
         }
     }
-    
+
     // Draw the maze walls (light gray)
     ctx.fillStyle = 'rgba(200, 200, 200, 0.9)';
     for (const wall of walls) {
@@ -3583,7 +4275,7 @@ function updateVRMiniMap() {
             ctx.fillRect(mapX, mapZ, width, height);
         }
     }
-    
+
     // Draw power-up locations
     if (powerUpSphereMesh && powerUpSphereMesh.visible) {
         ctx.fillStyle = 'rgba(255, 0, 0, 1.0)';
@@ -3593,7 +4285,7 @@ function updateVRMiniMap() {
         ctx.arc(powerUpX, powerUpZ, 6, 0, Math.PI * 2);
         ctx.fill();
     }
-    
+
     if (projectilePowerUpSphereMesh && projectilePowerUpSphereMesh.visible) {
         ctx.fillStyle = 'rgba(180, 0, 255, 1.0)';
         const projectilePowerUpX = centerX + projectilePowerUpSphereMesh.position.x * miniMapScale;
@@ -3602,7 +4294,7 @@ function updateVRMiniMap() {
         ctx.arc(projectilePowerUpX, projectilePowerUpZ, 6, 0, Math.PI * 2);
         ctx.fill();
     }
-    
+
     // Draw puzzle door if active and exists (for VR minimap)
     if (isPuzzleDoorActive && puzzleDoorMesh) {
         if (puzzleDoorMesh.visible) { // Only draw panel if it's visible
@@ -3646,21 +4338,21 @@ function updateVRMiniMap() {
             }
         }
     }
-    
+
     // Draw player position with direction indicator
     const xrCamera = renderer.xr.getCamera();
     if (xrCamera) {
         const position = new THREE.Vector3();
         xrCamera.getWorldPosition(position);
-        
+
         const playerX = centerX + position.x * miniMapScale;
         const playerZ = centerZ + position.z * miniMapScale;
-        
+
         // Draw player direction indicator
         const direction = new THREE.Vector3(0, 0, -1);
         direction.applyQuaternion(xrCamera.quaternion);
         direction.normalize();
-        
+
         ctx.strokeStyle = 'rgba(0, 255, 255, 0.9)';
         ctx.lineWidth = 2;
         ctx.beginPath();
@@ -3670,19 +4362,19 @@ function updateVRMiniMap() {
             playerZ + direction.z * 15
         );
         ctx.stroke();
-        
+
         // Draw player circle
         ctx.fillStyle = 'rgba(0, 255, 255, 1.0)';
         ctx.beginPath();
         ctx.arc(playerX, playerZ, 5, 0, Math.PI * 2);
         ctx.fill();
     }
-    
+
     // Draw border around minimap
     ctx.strokeStyle = 'rgba(0, 255, 255, 0.8)';
     ctx.lineWidth = 3;
     ctx.strokeRect(3, 3, mapWidth - 6, mapHeight - 6);
-    
+
     // Update the texture
     vrMiniMapTexture.needsUpdate = true;
 }
